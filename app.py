@@ -9,6 +9,7 @@ import boto3
 from pymongo import MongoClient
 from dotenv import load_dotenv
 import os 
+from mangum import Mangum
 
 load_dotenv()
 
@@ -353,6 +354,9 @@ def fetch_submit_info(case_data: CaseRequest):
         session.close()
 
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app,host="0.0.0.0",port=8000)
+# if __name__ == "__main__":
+#     import uvicorn
+#     uvicorn.run(app,host="0.0.0.0",port=8000)
+
+
+handler = Mangum(app)
