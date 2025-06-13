@@ -11,8 +11,6 @@ phases:
     commands:
       - echo Packaging Lambda function...
       - zip -r function.zip .
-      - echo "✅ Contents of function.zip:"
-      - unzip -l function.zip
 artifacts:
   files:
     - function.zip
