@@ -67,9 +67,9 @@ def fetch_submit_info(case_data: CaseRequest):
                 'est_code': case_data.est_code
             }
 
-
             search_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=casestatus/submitCaseNo"
             response = session.post(search_url, data=payload)
+
             html_content = response.json().get("case_data", "")
 
             if "Record not found" in html_content:
@@ -285,6 +285,7 @@ def fetch_submit_info(case_data: CaseRequest):
                                 }
 
                                 order_response = session.post(full_url, data=order_payload)
+
                                 try:
                                     token_update = order_response.json()
                                     new_app_token = token_update.get("app_token")
@@ -292,20 +293,19 @@ def fetch_submit_info(case_data: CaseRequest):
                                         app_token = new_app_token
                                 except Exception:
                                     pass
+                                
+                                order_response_data = order_response.json()
+                                print("order_response_data", order_response_data)
 
-                                pdf_soup = BeautifulSoup(order_response.text, "html.parser")
-                                pdf_object = pdf_soup.find("object")
+                                pdf_file_path = order_response_data.get("order", "").replace("\\", "")
 
-                                if not pdf_object:
-                                    print(f"❌ No PDF object found in response for order {order_number}.")
-                                    continue
-
-                                pdf_file_path = pdf_object.get("data", "").replace("\\", "")
                                 if not pdf_file_path:
                                     print(f"❌ PDF path not found in object for order {order_number}.")
                                     continue
 
                                 final_pdf_url = f"https://services.ecourts.gov.in/ecourtindia_v6/{pdf_file_path}"
+                                print(f"✅ Final PDF URL: {final_pdf_url}")
+
 
                                 s3_folder_path = f"case_data/orders/{case_info['cino']}/"
                                 s3_file_path = f"{s3_folder_path}{case_info['cino']}-{order_number}.pdf"
@@ -356,7 +356,7 @@ def fetch_submit_info(case_data: CaseRequest):
 
 # if __name__ == "__main__":
 #     import uvicorn
-#     uvicorn.run(app,host="0.0.0.0",port=8000)
+#     uvicorn.run(app,port=8000)
 
 
 handler = Mangum(app)
