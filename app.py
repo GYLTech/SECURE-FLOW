@@ -64,7 +64,8 @@ def fetch_submit_info(case_data: CaseRequest):
                 'state_code': case_data.state_code,
                 'dist_code': case_data.dist_code,
                 'court_complex_code': case_data.court_complex_code,
-                'est_code': case_data.est_code
+                'est_code': case_data.est_code,
+                'search_case_no' : case_data.case_no
             }
 
             search_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=casestatus/submitCaseNo"
