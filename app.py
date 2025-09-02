@@ -57,18 +57,24 @@ def fetch_submit_info(case_data: CaseRequest):
 
     try:
             payload = {
-                'ajax_req': 'true',
-                'case_type': case_data.case_type,
-                'case_no': case_data.case_no,
-                'rgyear': case_data.rgyear,
-                'state_code': case_data.state_code,
-                'dist_code': case_data.dist_code,
-                'court_complex_code': case_data.court_complex_code,
-                'est_code': case_data.est_code,
-                'search_case_no' : case_data.case_no
-            }
+                
+                            "ajax_req": "true",
+                            "petres_name": case_data.petres_name,      
+                            "rgyearP": case_data.rgyearP,              
+                            "case_status": case_data.case_status,      
+                            "case_type": case_data.case_type,         
+                            "case_no": case_data.case_no,              
+                            "rgyear": case_data.rgyear,                
+                            "state_code": case_data.state_code,       
+                            "dist_code": case_data.dist_code,          
+                            "court_complex_code": case_data.court_complex_code,  
+                            "est_code": case_data.est_code,            
+                            "search_case_no": case_data.case_no,       
+                            # "fcaptcha_code": case_data.fcaptcha_code,  
+                            "app_token": case_data.app_token           
+                        }
 
-            search_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=casestatus/submitCaseNo"
+            search_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=casestatus/submitPartyName"
             response = session.post(search_url, data=payload)
 
             html_content = response.json().get("case_data", "")
@@ -355,9 +361,9 @@ def fetch_submit_info(case_data: CaseRequest):
         session.close()
 
 
-# if __name__ == "__main__":
-#     import uvicorn
-#     uvicorn.run(app,port=8000)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app,port=8000)
 
 
-handler = Mangum(app)
+# handler = Mangum(app)
