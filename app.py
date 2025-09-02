@@ -115,10 +115,10 @@ def fetch_submit_info(case_data: CaseRequest):
                         "est_code": case_info["est_code"],
                         "search_flag": "CScaseNumber",
                         "search_by": "CScaseNumber",
-                        "ajax_req": "true",
+                        "ajax_req": "true", 
                     }
-
-                    second_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=home/viewHistory"
+# hello
+                    second_url ="https://services.ecourts.gov.in/ecourtindia_v6/?p=home/viewHistory"
                     second_response = session.post(second_url, data=second_payload)
                     
                     if second_response.status_code == 200:
