@@ -13,7 +13,6 @@ import os
 from mangum import Mangum
 import pytesseract
 import cv2
-import time
 import random
 import json
 
@@ -195,8 +194,6 @@ def extract_and_upload_orders(soup, s3_client, session, BUCKET_NAME, REGION_NAME
         })
 
     return orders
-
-
 
 def parse_case_history(html, payload, second_payload, case_info, session):
 
