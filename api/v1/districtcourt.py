@@ -17,7 +17,7 @@ app = APIRouter()
 
 class CaseRequest(BaseModel):
     case_type: str
-    case_no: str
+    case_reg_no: str
     rgyear: str
     state_code: str
     dist_code: str
@@ -30,8 +30,17 @@ class CaseRequest(BaseModel):
 def fetch_submit_info(case_data: CaseRequest):
     session = requests.Session()
     query = case_data.dict()
+    ac_query = {
+        "case_reg_no": query.get("case_reg_no"),
+        "rgyear": query.get("rgyear"),
+        "est_code": query.get("est_code"),
+        "case_type": query.get("case_type"),
+        "state_code": query.get("state_code"),
+        "dist_code": query.get("dist_code"),
+        "court_complex_code": query.get("court_complex_code")
+        }
     if case_data.refresh_flag != "1":
-        existing_case = collection.find_one(query)
+        existing_case = collection.find_one(ac_query)
         if existing_case:
             existing_case["_id"] = str(existing_case["_id"])
             return JSONResponse(content=existing_case)
@@ -42,13 +51,13 @@ def fetch_submit_info(case_data: CaseRequest):
             payload = {
                 'ajax_req': 'true',
                 'case_type': case_data.case_type,
-                'case_no': case_data.case_no,
+                'case_no': case_data.case_reg_no,
                 'rgyear': case_data.rgyear,
                 'state_code': case_data.state_code,
                 'dist_code': case_data.dist_code,
                 'court_complex_code': case_data.court_complex_code,
                 'est_code': case_data.est_code,
-                'search_case_no' : case_data.case_no
+                'search_case_no' : case_data.case_reg_no,
             }
 
             search_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=casestatus/submitCaseNo"
@@ -74,13 +83,14 @@ def fetch_submit_info(case_data: CaseRequest):
                     case_info = {
                         "case_no": values[0],
                         "cino": values[1],
-                        "court_code": int(values[2]) if values[2].isdigit() else None,
-                        "state_code": int(values[5]) if values[5].isdigit() else None,
-                        "dist_code": int(values[6]) if values[6].isdigit() else None,
-                        "court_complex_code": int(values[7]) if values[7].isdigit() else None,
+                        "court_code": values[2] or None,
+                        "state_code": values[5] or None,
+                        "dist_code": values[6] or None,
+                        "court_complex_code": values[7] or None,
                         "est_code":case_data.est_code,
                         "case_type" : case_data.case_type,
-                        "case_no" : case_data.case_no
+                        "rgyear" : case_data.rgyear,
+                        "case_reg_no" : case_data.case_reg_no
                     }
 
                     second_payload = {
@@ -268,7 +278,7 @@ def fetch_submit_info(case_data: CaseRequest):
                                 }
 
                                 order_response = session.post(full_url, data=order_payload)
-
+             
                                 try:
                                     token_update = order_response.json()
                                     new_app_token = token_update.get("app_token")
@@ -320,8 +330,12 @@ def fetch_submit_info(case_data: CaseRequest):
                                 })
 
                         final_response = {**case_info,**case_fir_details, **case_details, **case_status, **case_petitioner, **case_respondent, **acts_and_sections, **case_history, **case_transfer,"orders": orders}
-                        inserted_doc = collection.insert_one(final_response)
-                        final_response["_id"] = str(inserted_doc.inserted_id)
+                        result = collection.update_one(ac_query,{"$set": final_response},upsert=True)
+                        if result.upserted_id:
+                             final_response["_id"] = str(result.upserted_id)
+                        else:
+                            doc = collection.find_one(ac_query)
+                            final_response["_id"] = str(doc["_id"])
 
                         return JSONResponse(content=final_response)
                     else:
