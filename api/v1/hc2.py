@@ -280,7 +280,7 @@ def fetch_submit_hc_info(case_data: CaseRequest):
             'caseNoType': 'new',
             'search_case_no': case_data.case_reg_no
         }
-
+ #comment
 
             captcha_url = f"https://hcservices.ecourts.gov.in/hcservices/securimage/securimage_show.php?{random.randint(100000,999999)}"
             captcha_text = decode_captcha(session, captcha_url)
