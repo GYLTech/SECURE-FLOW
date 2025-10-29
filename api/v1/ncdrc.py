@@ -250,7 +250,7 @@ def parse_case_history(html, payload, second_payload, value, session):
     }
 
 
-@app.post("/hc2/getcaseInfo")
+@app.post("/ncdrc/getcaseInfo")
 def fetch_submit_hc_info(case_data: CaseRequest):
     session = requests.Session()
     query = case_data.dict()
@@ -264,7 +264,7 @@ def fetch_submit_hc_info(case_data: CaseRequest):
         "court_complex_code": query.get("court_complex_code")
     }
     if case_data.refresh_flag != "1":
-        existing_case = collection.find_one(ac_query)
+        existing_case = collection.find_one(query)
         if existing_case:
             existing_case["_id"] = str(existing_case["_id"])
             return JSONResponse(content=existing_case)
@@ -283,55 +283,46 @@ def fetch_submit_hc_info(case_data: CaseRequest):
             "court_code": case_data.court_complex_code,
         }
 
-        print(payload)
-
         headers = {
             'content-type': 'application/x-www-form-urlencoded',
             'origin': 'https://hcservices.ecourts.gov.in',
         }
         response = session.post(
             "https://hcservices.ecourts.gov.in/ecourtindiaHC/cases/case_no_qry.php", headers=headers, data=payload)
-        
-        clean_text = response.text.lstrip('\ufeff').replace("<br/>", " ")
-        decoded = html.unescape(html.unescape(clean_text)).strip()
+
+        clean_text = response.text.lstrip('\ufeff')
+        clean_text = clean_text.replace("<br/>", " ")
+        decoded = html.unescape(html.unescape(clean_text))
         values = decoded.split("~")
-        values = [v.strip().replace("##", "") for v in values if v.strip()]  
-            # clean_text = response.text.lstrip('\ufeff')
-            # clean_text = clean_text.replace("<br/>", " ")
-            # decoded = html.unescape(html.unescape(clean_text))
-            # values = decoded.split("~")
-            # values[-1] = values[-1].replace("##", "")
+        values[-1] = values[-1].replace("##", "")
         print(values)
-        if not values:
-            return JSONResponse(content={"data": "Invalid Case Details"}, status_code=404)
-        
         second_payload = {
-                "court_code": case_data.court_complex_code,
-                "state_code": case_data.state_code,
-                "court_complex_code": case_data.court_complex_code,
-                "case_no": values[0],
-                "cino": values[3],
-            }
+            "court_code": case_data.court_complex_code,
+            "state_code": case_data.state_code,
+            "court_complex_code": case_data.court_complex_code,
+            "case_no": values[0],
+            "cino": values[3],
+        }
         headers = {
-                'Origin': 'https://hcservices.ecourts.gov.in',
-                'Referer': 'https://hcservices.ecourts.gov.in/',
-                'Content-Type': 'application/x-www-form-urlencoded',
-            }
+            'Origin': 'https://hcservices.ecourts.gov.in',
+            'Referer': 'https://hcservices.ecourts.gov.in/',
+            'Content-Type': 'application/x-www-form-urlencoded',
+        }
         second_resp = session.post(
-                "https://hcservices.ecourts.gov.in/hcservices/cases_qry/o_civil_case_history.php",
-                data=second_payload,
-                headers=headers
-            )
+            "https://hcservices.ecourts.gov.in/hcservices/cases_qry/o_civil_case_history.php",
+            data=second_payload,
+            headers=headers
+        )
 
         testdata = parse_case_history(
-                second_resp.text, payload, second_payload, values[3], session)
+            second_resp.text, payload, second_payload, values[3], session)
         result = collection.update_one(
-                ac_query, {"$set": testdata}, upsert=True)
+            ac_query, {"$set": testdata}, upsert=True)
         if result.upserted_id:
-                testdata["_id"] = str(result.upserted_id)
+            testdata["_id"] = str(result.upserted_id)
         else:
-                doc = collection.find_one(ac_query)
-                testdata["_id"] = str(doc["_id"])
+            doc = collection.find_one(ac_query)
+            testdata["_id"] = str(doc["_id"])
 
         return testdata
 
