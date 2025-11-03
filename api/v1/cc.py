@@ -7,14 +7,13 @@ from core.database import collection
 import pytz
 import os
 import base64
-import boto3
+from core.s3_client import s3_client
 import requests
 from datetime import datetime
 
 load_dotenv()
 BUCKET_NAME = os.getenv("BUCKET_NAME")
 REGION_NAME = os.getenv("REGION_NAME")
-BASE_URL = "https://hcservices.ecourts.gov.in/hcservices/"
 
 app = APIRouter()
 IST = pytz.timezone("Asia/Kolkata")
@@ -33,9 +32,10 @@ def format_date(date_str):
     except Exception:
         return date_str
 
-def transform_case_data(response_json: dict, case_reg_no: str, s3_bucket_name: str):
+from datetime import datetime
+
+def transform_case_data(response_json: dict, case_reg_no: str):
     def format_date(date_str):
-        """Convert 'YYYY-MM-DD' to 'DD-MM-YYYY'."""
         if not date_str:
             return None
         try:
@@ -43,22 +43,39 @@ def transform_case_data(response_json: dict, case_reg_no: str, s3_bucket_name: s
         except Exception:
             return date_str
 
-    def upload_pdf_to_s3(base64_data: str, case_number: str, hearing_date: str):
-        """Upload decoded PDF to S3 and return the public URL."""
+    def parse_date(date_str):
+        """Convert 'YYYY-MM-DD' to datetime for sorting."""
         try:
-            pdf_bytes = base64.b64decode(base64_data)
-            file_name = f"case_data/orders/{case_number}_{hearing_date}.pdf"
+            return datetime.strptime(date_str, "%Y-%m-%d")
+        except Exception:
+            return None
 
-            s3_client = boto3.client("s3")
+    def upload_pdf_to_s3(base64_data: str, case_number: str, hearing_date: str):
+        try:
+            file_name = f"case_data/orders/{case_number}_{hearing_date}.pdf"
+            s3_url = f"https://{BUCKET_NAME}.s3.{REGION_NAME}.amazonaws.com/{file_name}"
+            try:
+                s3_client.head_object(Bucket=BUCKET_NAME, Key=file_name)
+                print(f"✅ File already exists in S3: {s3_url}")
+                return s3_url
+            except s3_client.exceptions.ClientError as e:
+                if e.response["Error"]["Code"] != "404":
+                    print(f"❌ S3 Error checking file: {e}")
+                    return None
+
+            pdf_bytes = base64.b64decode(base64_data)
+
             s3_client.put_object(
-                Bucket=s3_bucket_name,
+                Bucket=BUCKET_NAME,
                 Key=file_name,
                 Body=pdf_bytes,
-                ContentType="application/pdf"
+                ContentType="application/pdf",
+                ContentDisposition="inline"
             )
 
-            s3_url = f"https://{s3_bucket_name}.s3.amazonaws.com/{file_name}"
+            print(f"📄 Uploaded new PDF to S3: {s3_url}")
             return s3_url
+
         except Exception as e:
             print(f"❌ Error uploading PDF for {case_number} ({hearing_date}): {e}")
             return None
@@ -66,69 +83,87 @@ def transform_case_data(response_json: dict, case_reg_no: str, s3_bucket_name: s
     data = response_json.get("data", {})
     hearing_details = data.get("caseHearingDetails", [])
 
-    case_history = []
+    case_history_raw = []
+    seen_dates = set()
     orders = []
-    seen = set()
     order_counter = 1
 
-    # Core loop for hearing + order processing
     for hearing in hearing_details:
-        entry = {
+        raw_date = hearing.get("dateOfHearing")
+        if not raw_date:
+            continue
+
+        formatted_date = format_date(raw_date)
+        next_date = format_date(hearing.get("dateOfNextHearing"))
+        purpose = (hearing.get("caseStage") or "").strip()
+
+        if formatted_date in seen_dates:
+            continue
+        seen_dates.add(formatted_date)
+
+        case_history_raw.append({
             "judge": None,
-            "businessOnDate": format_date(hearing.get("dateOfHearing")),
-            "hearingDate": format_date(hearing.get("dateOfNextHearing")),
-            "purpose": hearing.get("caseStage"),
+            "businessOnDate": formatted_date,
+            "hearingDate": next_date,
+            "purpose": purpose,
             "inputType": "automatic",
-            "lawyerRemark": None
-        }
+            "lawyerRemark": None,
+            "_sort_key": parse_date(raw_date)
+        })
 
-        key = (entry["businessOnDate"], entry["hearingDate"], entry["purpose"])
-        if key not in seen:
-            seen.add(key)
-            case_history.append(entry)
 
-        # === Hit e-Jagriti API for daily order PDF ===
         case_number = data.get("caseNumber")
-        hearing_date = hearing.get("dateOfHearing")
         order_type_id = hearing.get("orderTypeId", 1)
 
-        if not case_number or not hearing_date:
+        if not case_number:
             continue
 
         api_url = (
-            "https://e-jagriti.gov.in/services//courtmaster/courtRoom/judgement/v1/getDailyOrderJudgementPdf"
-            f"?caseNumber={case_number}&dateOfHearing={hearing_date}&orderTypeId={order_type_id}"
+            "https://e-jagriti.gov.in/services/courtmaster/courtRoom/judgement/v1/getDailyOrderJudgementPdf"
+            f"?caseNumber={case_number}&dateOfHearing={raw_date}&orderTypeId={order_type_id}"
         )
 
+        headers = {
+            'Accept': 'application/json',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Connection': 'keep-alive',
+            'Referer': 'https://e-jagriti.gov.in/',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
+            'sec-ch-ua': '"Google Chrome";v="141", "Not?A_Brand";v="8", "Chromium";v="141"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"'
+        }
+
         try:
-            response = requests.get(api_url, timeout=15)
+            response = requests.get(api_url, headers=headers, timeout=15)
             res_json = response.json()
 
-            # ✅ Only proceed if success and PDF is present
             if response.status_code == 200 and res_json.get("data", {}).get("dailyOrderPdf"):
                 base64_blob = res_json["data"]["dailyOrderPdf"]
-
-                s3_url = upload_pdf_to_s3(
-                    base64_data=base64_blob,
-                    case_number=case_number,
-                    hearing_date=format_date(hearing_date)
-                )
+                s3_url = upload_pdf_to_s3(base64_blob, case_number, formatted_date)
 
                 if s3_url:
                     orders.append({
                         "order_number": str(order_counter),
-                        "order_date": format_date(hearing_date),
+                        "order_date": formatted_date,
                         "order_link": s3_url
                     })
                     order_counter += 1
             else:
-                print(f"ℹ️ No daily order found for hearing on {hearing_date}")
+                print(f"ℹ️ No daily order found for hearing on {formatted_date}")
 
         except Exception as e:
-            print(f"⚠️ Error fetching order for hearing {hearing_date}: {e}")
+            print(f"⚠️ Error fetching order for hearing {formatted_date}: {e}")
             continue
 
-    # Get latest hearing details
+    case_history_sorted = sorted(
+        [ch for ch in case_history_raw if ch["_sort_key"]],
+        key=lambda x: x["_sort_key"]
+    )
+    # Drop helper key
+    for ch in case_history_sorted:
+        ch.pop("_sort_key", None)
+
     latest_hearing = hearing_details[-1] if hearing_details else {}
 
     formatted_data = {
@@ -145,24 +180,21 @@ def transform_case_data(response_json: dict, case_reg_no: str, s3_bucket_name: s
         "FilingNumber": str(data.get("fillingReferenceNumber")),
         "RegistrationNumber": data.get("caseNumber"),
         "CNRNumber": None,
-        "FirstHearingDate": format_date(hearing_details[0].get("dateOfHearing")) if hearing_details else None,
+        "FirstHearingDate": case_history_sorted[0]["businessOnDate"] if case_history_sorted else None,
         "DecisionDate": format_date(latest_hearing.get("dateOfHearing")),
         "CaseStatus": latest_hearing.get("caseStage") if latest_hearing else None,
         "NatureofDisposal": None,
         "CourtNumberandJudge": None,
-        "petitioner_and_advocate": [
-            f"{data.get('complainant')}"
-        ],
-        "respondent_and_advocate": [
-            f"{data.get('respondent')}"
-        ],
+        "petitioner_and_advocate": [f"{data.get('complainant')}"],
+        "respondent_and_advocate": [f"{data.get('respondent')}"],
         "actsandSection": {"acts": None, "section": None},
-        "case_history": case_history,
+        "case_history": case_history_sorted,
         "case_transfer": [],
         "orders": orders
     }
 
     return formatted_data
+
 
 @app.post("/cc/getcaseInfo")
 def fetch_submit_hc_info(case_data: CaseRequest):
@@ -191,6 +223,14 @@ def fetch_submit_hc_info(case_data: CaseRequest):
         )
         response_json = response.json()
         transformed_data = transform_case_data(response_json, query.get("case_reg_no"))
+        result = collection.update_one(
+                ac_query, {"$set": transformed_data}, upsert=True)
+        if result.upserted_id:
+                transformed_data["_id"] = str(result.upserted_id)
+        else:
+                doc = collection.find_one(ac_query)
+                transformed_data["_id"] = str(doc["_id"])
+                
         return JSONResponse(content=transformed_data)
     finally:
         session.close()
