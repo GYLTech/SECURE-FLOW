@@ -1,40 +1,25 @@
 import requests
 from bs4 import BeautifulSoup
-from fastapi import FastAPI
+from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 import re
-import numpy as np
 from pydantic import BaseModel
 from typing import Optional
-import boto3
-from pymongo import MongoClient
 from dotenv import load_dotenv
-import os 
-from mangum import Mangum
 import pytesseract
 import cv2
 import random
 import json
-
+import numpy as np
+from core.database import collection
+from core.s3_client import s3_client
+import os
 load_dotenv()
-
-
-BASE_URL = "https://hcservices.ecourts.gov.in/hcservices/"
-
-client = MongoClient(os.getenv("MONGOCLIENT"))
-db = client["gylscrdata"]
-collection = db["casedetails"]
-
 BUCKET_NAME = os.getenv("BUCKET_NAME")
 REGION_NAME = os.getenv("REGION_NAME")
+BASE_URL = "https://hcservices.ecourts.gov.in/hcservices/"
 
-s3_client = boto3.client(
-    "s3",
-    aws_access_key_id=os.getenv("AWS_S3_KEY"),
-    aws_secret_access_key=os.getenv("AWS_S3SEC_KEY")
-)
-
-app = FastAPI()
+app = APIRouter()
 
 class CaseRequest(BaseModel):
     case_type: str
@@ -45,7 +30,7 @@ class CaseRequest(BaseModel):
     court_complex_code: str
     est_code: Optional[str] = None
     refresh_flag : str
-    CaseType : str
+
 
 def decode_captcha(session, captcha_url):
     response = session.get(captcha_url, stream=True)
@@ -55,31 +40,13 @@ def decode_captcha(session, captcha_url):
         image = cv2.imdecode(image, cv2.IMREAD_GRAYSCALE)
 
         _, thresh_img = cv2.threshold(image, 150, 255, cv2.THRESH_BINARY_INV)
-        pytesseract.pytesseract.tesseract_cmd = r'C:\\Program Files\\Tesseract-OCR\\tesseract.exe'
+        pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe'
         captcha_text = pytesseract.image_to_string(thresh_img, config="--psm 6").strip()
         return captcha_text
     return None
 
-
 def clean_text(text):
     return re.sub(r"\s+", " ", text.strip())
-
-def extract_table_data(soup, heading, fields):
-    extracted_data = {}
-    heading_element = soup.find("h2", string=re.compile(heading, re.IGNORECASE))
-    if heading_element:
-        table = heading_element.find_next("table")
-        if table:
-            rows = table.find_all("tr")
-            for row in rows:
-                cols = row.find_all("td")
-                if len(cols) >= 2:
-                    label = clean_text(cols[0].get_text())
-                    value = clean_text(cols[1].get_text())
-                    if label in fields:
-                        extracted_data[label] = value
-    return extracted_data
-
 
 
 def extract_party_details(soup, class_name):
@@ -100,6 +67,23 @@ def extract_party_details(soup, class_name):
 
     return extracted_data
 
+
+def extract_table_data(soup, heading, fields):
+    extracted_data = {}
+    heading_element = soup.find("h2", string=re.compile(heading, re.IGNORECASE))
+    if heading_element:
+        table = heading_element.find_next("table")
+        if table:
+            rows = table.find_all("tr")
+            for row in rows:
+                cols = row.find_all("td")
+                if len(cols) >= 2:
+                    label = clean_text(cols[0].get_text())
+                    value = clean_text(cols[1].get_text())
+                    if label in fields:
+                        extracted_data[label] = value
+    return extracted_data
+
 def extract_subordinate_court_info(soup):
     court_info = soup.find("span", class_="Lower_court_table")
     if not court_info:
@@ -116,27 +100,43 @@ def extract_subordinate_court_info(soup):
 
     return details
 
-def extract_table_with_headers(soup, heading=None, headers=None, className=None):
-    extracted_data = []
-    table = None
+def extract_high_court_case_history(soup):
+    history = []
+    for table in soup.find_all("table", {"class": "history_table"}):
+        headers = [th.get_text(strip=True) for th in table.find_all("th")]
 
-    if className:
-        table = soup.find("table", class_=className)
+        if "Cause List Type" in headers and "Purpose of hearing" in headers:
+            rows = table.find_all("tr")[1:]  
+            for row in rows:
+                cols = row.find_all("td")
+                if len(cols) >= 5:
+                    cause_list_type = cols[0].get_text(strip=True)
+                    judge = cols[1].get_text(strip=True)
+                    business_on_date = (
+                        cols[2].find("a").get_text(strip=True)
+                        if cols[2].find("a")
+                        else cols[2].get_text(strip=True)
+                    )
+                    hearing_date = cols[3].get_text(strip=True)
+                    purpose = cols[4].get_text(strip=True)
+                    if (
+                        cause_list_type == "Order Number"
+                        or "Order on" in judge
+                        or purpose in ["Order Details", "View"]
+                    ):
+                        continue
 
-    elif heading:
-        heading_element = soup.find("h2", string=re.compile(heading, re.IGNORECASE))
-        if heading_element:
-            table = heading_element.find_next("table")
+                    history.append({
+                        "causeListType": cause_list_type,
+                        "judge": judge,
+                        "businessOnDate": business_on_date,
+                        "hearingDate": hearing_date,
+                        "purpose": purpose,
+                        "inputType": "automatic",
+                        "lawyerRemark": None
+                    })
+    return history
 
-    if table and headers:
-        rows = table.find_all("tr")[1:] 
-        for row in rows:
-            cols = row.find_all("td")
-            if len(cols) == len(headers):
-                entry = {headers[i]: clean_text(cols[i].get_text()) for i in range(len(headers))}
-                extracted_data.append(entry)
-
-    return extracted_data
 
 def extract_and_upload_orders(soup, s3_client, session, BUCKET_NAME, REGION_NAME, case_info):
     orders = []
@@ -195,12 +195,11 @@ def extract_and_upload_orders(soup, s3_client, session, BUCKET_NAME, REGION_NAME
 
     return orders
 
-def parse_case_history(html, payload, second_payload, case_info, session):
 
+def parse_case_history(html, payload, second_payload, case_info, session):
     soup = BeautifulSoup(html, "html.parser")
 
     case_details = extract_table_data(soup, "Case Details", ["Filing Number", "Filing Date", "Registration Number", "Registration Date", "CNR Number"])
-
     case_status = extract_table_data(soup, "Case Status", [
         "First Hearing Date",
         "Decision Date",
@@ -215,81 +214,49 @@ def parse_case_history(html, payload, second_payload, case_info, session):
         "Stage of Case"
     ])
 
-    
-
     petitioner_and_advocate = extract_party_details(soup, "Petitioner_Advocate_table")
     respondent_and_advocate = extract_party_details(soup, "Respondent_Advocate_table")
-
     category_details = extract_table_data(soup, "Category", ["Category", "Sub Category"])
-
     subordinate_court_info = extract_subordinate_court_info(soup)
-
-    raw_case_hearing_history  = extract_table_with_headers(soup, "History of Case Hearing", [
-        "Cause List Type",
-        "Judge",
-        "Business On Date",
-        "Hearing Date",
-        "Purpose of hearing"
-    ],
-    className="history_table")
-
-    case_hearing_history = []
-    for entry in raw_case_hearing_history:
-        case_hearing_history.append({
-            "judge": entry.get("Judge", ""),
-            "businessOnDate": entry.get("Business On Date", ""),
-            "hearingDate": entry.get("Hearing Date", ""),
-            "purpose": entry.get("Purpose of hearing", ""),
-            "inputType": "automatic",
-            "lawyerRemark": None
-        })
-
-
-        orders = extract_and_upload_orders(
-            soup,
-            s3_client=s3_client,
-            session=session,
-            BUCKET_NAME=BUCKET_NAME,
-            REGION_NAME=REGION_NAME,
-            case_info=case_info
-)
+    high_court_case_history = extract_high_court_case_history(soup)
+    orders_hc = extract_and_upload_orders(
+        soup,
+        s3_client=s3_client,
+        session=session,
+        BUCKET_NAME=BUCKET_NAME,
+        REGION_NAME=REGION_NAME,
+        case_info=case_info
+    )
 
     return {
-            "success" : True,
-            "data": {
-            "case_no" : second_payload.get("case_no"),
+            "case_no": second_payload.get("case_no"),
             "cino": second_payload.get("cino"),
-            "court_code" : second_payload.get("court_code"),
-            "state_code" : payload.get("state_code"),
-            "dist_code" : payload.get("dist_code"),
-            "court_complex_code" : payload.get("court_complex_code"),
-            "est_code" : payload.get("est_code"),
-            "case_type" : payload.get("case_type"),
-            "CaseType" : payload.get("CaseType"),
-            "FilingNumber" : case_details.get("Filing Number", ""),
-            "RegistrationNumber" : case_details.get("Registration Number", ""),
-            "CNRNumber" : second_payload.get("cino"),
-            "FirstHearingDate" : case_status.get("First Hearing Date", ""),
+            "court_code": second_payload.get("court_code"),
+            "state_code": payload.get("state_code"),
+            "dist_code": payload.get("dist_code"),
+            "court_complex_code": payload.get("court_complex_code"),
+            "est_code": payload.get("est_code"),
+            "case_type": payload.get("case_type"),
+            "CaseType": payload.get("CaseType"),
+            "FilingNumber": case_details.get("Filing Number", ""),
+            "RegistrationNumber": case_details.get("Registration Number", ""),
+            "CNRNumber": second_payload.get("cino"),
+            "FirstHearingDate": case_status.get("First Hearing Date", ""),
             "CaseStatus": case_status.get("Stage of Case", ""),
-            "CourtNumberandJudge" : case_status.get("Coram", ""),
+            "CourtNumberandJudge": case_status.get("Coram", ""),
             "petitioner_and_advocate": petitioner_and_advocate,
             "respondent_and_advocate": respondent_and_advocate,
-            "actsandSection" : {},
+            "actsandSection": {},
             "category_details": category_details,
             "subordinate_court_information": subordinate_court_info,
-            "case_history": case_hearing_history,
-            "orders": orders
-        }
+            "case_history": high_court_case_history,
+            "case_transfer" : [],
+            "orders": orders_hc 
     }
 
 
-@app.get("/")
-async def root():
-    return {"message": "Hello World"}
-
-
 @app.post("/hc/getcaseInfo")
-def fetch_submit_info(case_data: CaseRequest):
+def fetch_submit_hc_info(case_data: CaseRequest):
     session = requests.Session()
     query = case_data.dict()
     if case_data.refresh_flag != "1":
@@ -325,8 +292,6 @@ def fetch_submit_info(case_data: CaseRequest):
                 data=payload
             )
 
-            print("Response Status Code:", response.text)
-
             raw_text = response.text.strip()
             soup = BeautifulSoup(raw_text, "html.parser")
             clean_text = soup.get_text()
@@ -361,7 +326,6 @@ def fetch_submit_info(case_data: CaseRequest):
                     "cino": case_details.get("cino"),
                 }
 
-                print("Second Payload:", second_payload)
                 headers = {
                 'Origin': 'https://hcservices.ecourts.gov.in',
                 'Referer': 'https://hcservices.ecourts.gov.in/',
@@ -373,7 +337,9 @@ def fetch_submit_info(case_data: CaseRequest):
                     headers=headers
                 )
 
-                return parse_case_history(second_resp.text,payload,second_payload, case_info=case_details, session=session)
+                testdata = parse_case_history(second_resp.text,payload,second_payload, case_details, session)
+
+                return testdata
 
         else:
             return JSONResponse(
@@ -383,11 +349,3 @@ def fetch_submit_info(case_data: CaseRequest):
 
     finally:
         session.close()
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
-
-
-# handler = Mangum(app)
