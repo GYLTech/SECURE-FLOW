@@ -160,7 +160,7 @@ def transform_case_data(response_json: dict, case_reg_no: str):
         [ch for ch in case_history_raw if ch["_sort_key"]],
         key=lambda x: x["_sort_key"]
     )
-    # Drop helper key
+ 
     for ch in case_history_sorted:
         ch.pop("_sort_key", None)
 
