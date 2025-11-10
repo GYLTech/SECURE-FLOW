@@ -28,6 +28,16 @@ class CaseRequest(BaseModel):
     est_code: Optional[str] = None
     refresh_flag: str
 
+class CaseRequestBulk(BaseModel):
+    petres_name: str
+    rgyearP: str
+    case_status: str
+    state_code: str
+    dist_code: str
+    court_complex_code: str
+    est_code: Optional[str] = None
+    courtType: Optional[str] = None
+
 
 def clean_text(text):
     return re.sub(r"\s+", " ", text.strip())
@@ -283,8 +293,6 @@ def fetch_submit_hc_info(case_data: CaseRequest):
             "court_code": case_data.court_complex_code,
         }
 
-        print(payload)
-
         headers = {
             'content-type': 'application/x-www-form-urlencoded',
             'origin': 'https://hcservices.ecourts.gov.in',
@@ -296,12 +304,6 @@ def fetch_submit_hc_info(case_data: CaseRequest):
         decoded = html.unescape(html.unescape(clean_text)).strip()
         values = decoded.split("~")
         values = [v.strip().replace("##", "") for v in values if v.strip()]  
-            # clean_text = response.text.lstrip('\ufeff')
-            # clean_text = clean_text.replace("<br/>", " ")
-            # decoded = html.unescape(html.unescape(clean_text))
-            # values = decoded.split("~")
-            # values[-1] = values[-1].replace("##", "")
-        print(values)
         if not values:
             return JSONResponse(content={"data": "Invalid Case Details"}, status_code=404)
         

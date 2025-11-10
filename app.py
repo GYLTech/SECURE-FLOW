@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from api.v1 import districtcourt, hc2, cc, nclt
+from api.v1 import districtcourt, hc2, cc, nclt,sci
 app = FastAPI(title="Secure Flow By GYL")
 
 @app.get("/")
@@ -11,6 +11,8 @@ app.include_router(districtcourt.app, prefix="/api/v1", tags=["Districtcourt"])
 app.include_router(hc2.app, prefix="/api/v1", tags=["Hccourt2"])
 app.include_router(cc.app, prefix="/api/v1", tags=["Consumer"])
 app.include_router(nclt.app, prefix="/api/v1", tags=["Nclt"])
+app.include_router(sci.app, prefix="/api/v1", tags=["Sci"])
+
 
 
 
