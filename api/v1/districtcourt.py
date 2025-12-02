@@ -47,6 +47,11 @@ class CaseRequestBulkIngest(BaseModel):
     rgyear: str
     courtType: Optional[str] = None
 
+def sanitize_key(key):
+    key = re.sub(r'[.$]', '', key)
+    key = key.replace(':', '').replace(' ', '')
+    return key
+
 @app.post("/getcaseInfo")
 def fetch_submit_info(case_data: CaseRequest):
     session = requests.Session()
@@ -144,8 +149,8 @@ def fetch_submit_info(case_data: CaseRequest):
                             for row in rows:
                                 cells = row.find_all("td")
                                 if len(cells) >= 2:
-                                    key = cells[0].get_text(strip=True).replace(
-                                        ':', '').replace(' ', '')
+                                    raw_key = cells[0].get_text(strip=True)
+                                    key = sanitize_key(raw_key)
                                     value = cells[1].get_text(strip=True)
                                     data[key] = value
                         return data
@@ -272,7 +277,7 @@ def fetch_submit_info(case_data: CaseRequest):
                             order_date = cols[1].text.strip()
                             order_link = cols[2].find("a")
 
-                            print("order link", order_link)
+                            # print("order link", order_link)
 
                             if not order_link:
                                 print(
@@ -335,12 +340,12 @@ def fetch_submit_info(case_data: CaseRequest):
                                 "app_token": app_token
                             }
 
-                            print("order_payload", order_payload)
+                            # print("order_payload", order_payload)
                             full_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=home/display_pdf"
 
                             order_response = session.post(
                                 full_url, data=order_payload)
-                            print("order response,", order_response.text)
+                            # print("order response,", order_response.text)
 
                             try:
                                 token_update = order_response.json()
@@ -398,6 +403,9 @@ def fetch_submit_info(case_data: CaseRequest):
 
                     final_response = {**case_info, **case_fir_details, **case_details, **case_status, **case_petitioner,
                                       **case_respondent, **acts_and_sections, **case_history, **case_transfer, "orders": orders}
+                    
+
+                    # print("final response",final_response)
                     result = collection.update_one(
                         ac_query, {"$set": final_response}, upsert=True)
                     if result.upserted_id:
