@@ -660,6 +660,7 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
 
         orders = []
         order_table = soup.find("table", {"class": "order_table"})
+
         if order_table:
             rows = order_table.find_all("tr")[1:]
             app_token = case_details.get("app_token", "")
@@ -671,11 +672,21 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
 
                 order_number = cols[0].text.strip()
                 order_date = cols[1].text.strip()
-                order_link = cols[2].find("a")
-                if not order_link:
+
+                all_links = cols[2].find_all("a")
+                valid_link = None
+
+                for a in all_links:
+                    onclick = a.get("onclick", "")
+                    if re.search(r"displayPdf\((.*?)\)", onclick):
+                        valid_link = a
+                        break
+
+                if not valid_link:
                     continue
 
-                match = re.search(r"displayPdf\((.*?)\)", order_link.get("onclick", ""))
+                onclick_attr = valid_link.get("onclick", "")
+                match = re.search(r"displayPdf\((.*?)\)", onclick_attr)
                 if not match:
                     continue
 
@@ -683,7 +694,10 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
                 if len(values) < 4:
                     continue
 
-                normal_v, case_val, court_code, filename = values[:4]
+                normal_v = values[0]
+                case_val = values[1]
+                court_code = values[2]
+                filename = values[3]
                 app_flag = values[4] if len(values) > 4 else ""
 
                 order_payload = {
@@ -704,7 +718,7 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
                     new_app_token = token_update.get("app_token")
                     if new_app_token:
                         app_token = new_app_token
-                except Exception:
+                except:
                     pass
 
                 order_response_data = order_response.json()
@@ -713,8 +727,10 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
                     continue
 
                 final_pdf_url = f"https://services.ecourts.gov.in/ecourtindia_v6/{pdf_file_path}"
+
                 s3_folder_path = f"case_data/orders/{case_info['cino']}/"
                 s3_file_path = f"{s3_folder_path}{case_info['cino']}-{order_number}.pdf"
+                
 
                 try:
                     s3_client.head_object(Bucket=BUCKET_NAME, Key=s3_file_path)
