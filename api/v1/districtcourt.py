@@ -1,3 +1,5 @@
+import random
+import time
 import requests
 from bs4 import BeautifulSoup
 from fastapi import APIRouter
@@ -9,6 +11,7 @@ from dotenv import load_dotenv
 from core.database import collection
 from core.s3_client import s3_client
 import os
+from http.client import RemoteDisconnected
 load_dotenv()
 BUCKET_NAME = os.getenv("BUCKET_NAME")
 REGION_NAME = os.getenv("REGION_NAME")
@@ -52,6 +55,31 @@ def sanitize_key(key):
     key = key.replace(':', '').replace(' ', '')
     return key
 
+
+def safe_post(session, url, data, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            time.sleep(random.uniform(1.2, 2.0))  
+
+            response = session.post(
+                url,
+                data=data,
+                timeout=(10, 120), 
+                headers={"Connection": "close"} 
+            )
+            return response
+
+        except (requests.exceptions.ConnectionError, RemoteDisconnected) as e:
+            print(f"⚠️ Server disconnected (attempt {attempt+1})")
+
+            session.close()
+            session = requests.Session()
+
+        except requests.exceptions.Timeout:
+            print(f"⚠️ Timeout (attempt {attempt+1})")
+
+    raise Exception("❌ eCourts viewHistory failed after retries")
+
 @app.post("/getcaseInfo")
 def fetch_submit_info(case_data: CaseRequest):
     session = requests.Session()
@@ -87,7 +115,7 @@ def fetch_submit_info(case_data: CaseRequest):
         }
 
         search_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=casestatus/submitCaseNo"
-        response = session.post(search_url, data=payload)
+        response = safe_post(session,search_url, payload)
 
         html_content = response.json().get("case_data", "")
 
@@ -134,7 +162,8 @@ def fetch_submit_info(case_data: CaseRequest):
 
                 second_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=home/viewHistory"
 
-                second_response = session.post(second_url, data=second_payload)
+                second_response = safe_post(session,second_url, second_payload)
+                print("second response",second_response.text)
 
                 if second_response.status_code == 200:
                     case_details = second_response.json()
@@ -277,7 +306,7 @@ def fetch_submit_info(case_data: CaseRequest):
                             order_date = cols[1].text.strip()
                             order_link = cols[2].find("a")
 
-                            # print("order link", order_link)
+                            print("order link", order_link)
 
                             if not order_link:
                                 print(
@@ -311,7 +340,6 @@ def fetch_submit_info(case_data: CaseRequest):
                                 continue
 
                             params = match.group(1)
-                            # values = [v.strip().strip("'") for v in params.split("&")]
                             values = [v.strip().strip("'")
                                       for v in params.split(",")]
 
@@ -326,10 +354,6 @@ def fetch_submit_info(case_data: CaseRequest):
                             filename = values[3]
                             app_flag = values[4] if len(values) > 4 else ""
 
-                            # base_path = values[0]
-                            # query_string = "&".join(values[1:])
-                            # full_url = f"https://services.ecourts.gov.in/ecourtindia_v6/?p={base_path}&{query_string}"
-
                             order_payload = {
                                 "normal_v": normal_v,
                                 "case_val": case_val,
@@ -340,12 +364,9 @@ def fetch_submit_info(case_data: CaseRequest):
                                 "app_token": app_token
                             }
 
-                            # print("order_payload", order_payload)
                             full_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=home/display_pdf"
-
-                            order_response = session.post(
-                                full_url, data=order_payload)
-                            # print("order response,", order_response.text)
+                            order_response = safe_post(session,full_url, order_payload)
+                            print("order response,", order_response.text)
 
                             try:
                                 token_update = order_response.json()
@@ -441,7 +462,7 @@ def fetch_submit_info(case_data: CaseRequestBulk):
         }
 
         search_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=casestatus/submitPartyName"
-        response = session.post(search_url, data=payload)
+        response = safe_post(session,search_url,payload)
 
         html_content = response.json().get("party_data", "")
 
@@ -543,12 +564,8 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
         }
         if case_info.get("est_code") is not None:
             second_payload["est_code"] = str(case_info["est_code"])
-
-        # print("second_payload to be printed_______________", second_payload)
-
         second_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=home/viewHistory"
-        second_response = session.post(second_url, data=second_payload)
-        # print("second_response status code", second_response.text)
+        second_response = safe_post(session,second_url, second_payload)
 
         if second_response.status_code != 200:
             print("❌ Failed request for", case_info["cino"])
@@ -711,7 +728,7 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
                 }
 
                 full_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=home/display_pdf"
-                order_response = session.post(full_url, data=order_payload)
+                order_response = safe_post(session,full_url, order_payload)
 
                 try:
                     token_update = order_response.json()
