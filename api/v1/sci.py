@@ -1,3 +1,4 @@
+import json
 from typing import Optional
 import requests
 from bs4 import BeautifulSoup
@@ -9,6 +10,7 @@ from pymongo import MongoClient
 from dotenv import load_dotenv
 import os
 from core.s3_client import s3_client
+from core.lambda_client import lambda_client
 
 load_dotenv()
 
@@ -22,10 +24,64 @@ BUCKET_NAME = os.getenv("BUCKET_NAME")
 REGION_NAME = os.getenv("REGION_NAME")
 
 app = APIRouter()
+MAX_RETRIES = 3
+
+def solve_captcha(lambda_client, image_url):
+    payload = {
+        "image_url": image_url,
+        "frm": "sci"
+    }
+
+    response = lambda_client.invoke(
+        FunctionName="GYL-MS-Swipe-Captcha-Solver-V1",
+        InvocationType="RequestResponse",
+        Payload=json.dumps(payload)
+    )
+
+    response_payload = response['Payload'].read().decode()
+    data = json.loads(response_payload)
+
+    expression = data.get("text")
+    if not expression:
+        raise ValueError("Captcha expression not found")
+
+    return eval(expression)
+
+def extract_case_data(html_content: str):
+  
+    soup = BeautifulSoup(html_content, "html.parser")
+    results = []
+
+    rows = soup.select("table tbody tr")
+
+    for row in rows:
+        diary_no = row.get("data-diary-no")
+        diary_year = row.get("data-diary-year")
+
+        petitioner = row.select_one("td.petitioners")
+        respondent = row.select_one("td.respondents")
+
+        results.append({
+            "diary_number": diary_no,
+            "year": diary_year,
+            "petitioner_name": petitioner.get_text(strip=True) if petitioner else None,
+            "respondent_name": respondent.get_text(strip=True) if respondent else None
+        })
+
+    return results
 
 class CaseRequest(BaseModel):
     diary_year: str
     diary_no: str
+    state_code: Optional[str] = None
+    dist_code: Optional[str] = None
+    court_complex_code: Optional[str] = None
+    est_code: Optional[str] = None
+
+class CaseRequestAOR(BaseModel):
+    aor_code: str
+    rgyear: str
+    case_status: str
     state_code: Optional[str] = None
     dist_code: Optional[str] = None
     court_complex_code: Optional[str] = None
@@ -223,5 +279,83 @@ def fetch_submit_info(case_data: CaseRequest):
         return JSONResponse(content=result, status_code=200)
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)
+    finally:
+        session.close()
+
+
+@app.post("/sci/bulk_i/aor")
+def fetch_submit_info(case_data: CaseRequestAOR):
+    session = requests.Session()
+
+    try:
+        for attempt in range(1, MAX_RETRIES + 1):
+            print(f"Captcha attempt {attempt}")
+
+            lambda_payload = {
+                "image_url": "https://www.sci.gov.in/?_siwp_captcha&id=hojd0afgm07crqxwenrybr345qnurmjr1iu1mvgm",
+                "frm": "sci"
+            }
+
+            lambda_response = lambda_client.invoke(
+                FunctionName="GYL-MS-Swipe-Captcha-Solver-V1",
+                InvocationType="RequestResponse",
+                Payload=json.dumps(lambda_payload)
+            )
+
+            response_payload = lambda_response["Payload"].read().decode()
+            lambda_data = json.loads(response_payload)
+
+            expression = lambda_data.get("text")
+            if not expression:
+                continue
+
+            result_captcha = eval(expression)
+            print("Solved captcha:", result_captcha)
+
+            payload = {
+                "party_type": "any",
+                "aor_code": case_data.aor_code,
+                "year": case_data.rgyear,
+                "case_status": case_data.case_status,
+                "scid": "hojd0afgm07crqxwenrybr345qnurmjr1iu1mvgm",
+                "siwp_captcha_value": str(result_captcha),
+                "action": "get_case_status_aor_code",
+                "es_ajax_request": "1",
+                "language": "en"
+            }
+
+            headers = {
+                "referer": "https://www.sci.gov.in/case-status-case-no/",
+                "x-requested-with": "XMLHttpRequest"
+            }
+
+            response = session.get(BASE_URL, params=payload, headers=headers)
+            response_json = response.json()
+        
+            if response_json.get("success") is False :
+                print("Captcha incorrect, retrying...")
+                continue
+
+            data_value = response_json.get("data")
+            if not data_value or "No records found" in str(data_value):
+                return JSONResponse(
+                    content={"error": "Invalid Case Details"},
+                    status_code=404
+                )
+            data_value = response_json.get("data", {}).get("resultsHtml")
+            cases = extract_case_data(data_value)
+            return JSONResponse(content={
+                "success" : True,
+                "data" : cases
+            }, status_code=200)
+
+        return JSONResponse(
+            content={"error": "Unable to get response from SCI at this moment"},
+            status_code=404
+        )
+
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
     finally:
         session.close()
