@@ -24,7 +24,8 @@ BUCKET_NAME = os.getenv("BUCKET_NAME")
 REGION_NAME = os.getenv("REGION_NAME")
 
 app = APIRouter()
-MAX_RETRIES = 3
+MAX_RETRIES = 5
+
 
 def solve_captcha(lambda_client, image_url):
     payload = {
@@ -47,8 +48,9 @@ def solve_captcha(lambda_client, image_url):
 
     return eval(expression)
 
-def extract_case_data(html_content: str):
-  
+
+def extract_case_data(html_content: str, case_status: str):
+
     soup = BeautifulSoup(html_content, "html.parser")
     results = []
 
@@ -64,11 +66,13 @@ def extract_case_data(html_content: str):
         results.append({
             "diary_number": diary_no,
             "year": diary_year,
+            "case_status": case_status,
             "petitioner_name": petitioner.get_text(strip=True) if petitioner else None,
             "respondent_name": respondent.get_text(strip=True) if respondent else None
         })
 
     return results
+
 
 class CaseRequest(BaseModel):
     diary_year: str
@@ -77,6 +81,7 @@ class CaseRequest(BaseModel):
     dist_code: Optional[str] = None
     court_complex_code: Optional[str] = None
     est_code: Optional[str] = None
+
 
 class CaseRequestAOR(BaseModel):
     aor_code: str
@@ -87,18 +92,22 @@ class CaseRequestAOR(BaseModel):
     court_complex_code: Optional[str] = None
     est_code: Optional[str] = None
 
+
 def clean_text(text):
     return re.sub(r"\s+", " ", text.strip())
+
 
 def extract_party_details_flexible(soup):
     def extract_list_by_label(label):
         parties = []
-        possible_labels = soup.find_all("td", text=re.compile(fr"{label}", re.IGNORECASE))
+        possible_labels = soup.find_all(
+            "td", text=re.compile(fr"{label}", re.IGNORECASE))
         for lbl in possible_labels:
             next_sib = lbl.find_next_sibling("td")
             if next_sib:
                 text = next_sib.get_text(separator="\n").strip()
-                lines = [clean_text(line) for line in text.split("\n") if line.strip()]
+                lines = [clean_text(line)
+                         for line in text.split("\n") if line.strip()]
                 cleaned = [re.sub(r"^\d+\s*", "", line) for line in lines]
                 parties.extend(cleaned)
         return parties
@@ -107,6 +116,7 @@ def extract_party_details_flexible(soup):
         "petitioner": extract_list_by_label("Petitioner"),
         "respondent": extract_list_by_label("Respondent")
     }
+
 
 def extract_label_value_pairs(soup, labels):
     tds = [td.get_text(strip=True) for td in soup.find_all("td")]
@@ -119,6 +129,7 @@ def extract_label_value_pairs(soup, labels):
             data[label] = None
     return data
 
+
 def extract_table_with_headers(soup, className=None, headers=None):
     extracted_data = []
     table = None
@@ -127,56 +138,61 @@ def extract_table_with_headers(soup, className=None, headers=None):
         table = soup.find("table", class_=className)
 
     if table and headers:
-        rows = table.find_all("tr")[1:] 
+        rows = table.find_all("tr")[1:]
         for row in rows:
             cols = row.find_all("td")
             if len(cols) == len(headers):
-                entry = {headers[i]: clean_text(cols[i].get_text()) for i in range(len(headers))}
+                entry = {headers[i]: clean_text(
+                    cols[i].get_text()) for i in range(len(headers))}
                 extracted_data.append(entry)
 
     return extracted_data
+
 
 def parse_case_history(html, data, session):
 
     soup = BeautifulSoup(html, "html.parser")
     case_labels = ["Diary Number", "Case Number", "CNR Number", "Filed On"]
-    status_labels = ["Present/Last Listed On", "Status/Stage", "Category", "Coram"]
+    status_labels = ["Present/Last Listed On",
+                     "Status/Stage", "Category", "Coram"]
     case_data = extract_label_value_pairs(soup, case_labels)
     match = re.search(r"([\w()]+)\s*No\.", case_data.get("Case Number", ""))
     caseTy = match.group(1) if match else None
     status_data = extract_label_value_pairs(soup, status_labels)
-    judge_match = re.match(r"(\d{2}-\d{2}-\d{4})\s*\[(.*)\]", status_data.get("Present/Last Listed On", ""))
+    judge_match = re.match(
+        r"(\d{2}-\d{2}-\d{4})\s*\[(.*)\]", status_data.get("Present/Last Listed On", ""))
     parties = extract_party_details_flexible(soup)
 
     result = {
-    "est_code": None,
-    "cino": case_data.get("CNR Number", ""),
-    "state_code": data.state_code,
-    "court_complex_code": data.court_complex_code,
-    "rgyear": data.diary_year,
-    "case_type": caseTy,
-    "dist_code": data.dist_code,
-    "CNRNumber": case_data.get("CNR Number", ""),
-    "CaseStatus": re.match(r"([A-Z\s]+)\s*\(", status_data.get("Status/Stage", "")).group(1).strip() if re.match(r"([A-Z\s]+)\s*\(", status_data.get("Status/Stage", "")) else None,
-    "CaseType": caseTy,
-    "CourtNumberandJudge": judge_match.group(2).replace("and", ", ") if judge_match else None,
-    "DecisionDate": None,
-    "FilingNumber": data.diary_no + "/" + data.diary_year,
-    "NatureofDisposal": None,
-    "RegistrationNumber": data.diary_no + "/" + data.diary_year,
-    "actsandSection": {
-        "acts": status_data.get("Category", ""),
-        "section": None
-    },
-    "case_history": [],
-    "case_no": data.diary_no,
-    "courtType": "sci",
-    "court_code": data.court_complex_code,
-    "orders": [],
-    "petitioner_and_advocate": parties.get("petitioner", []),
-    "respondent_and_advocate": parties.get("respondent", []),
+        "est_code": None,
+        "cino": case_data.get("CNR Number", ""),
+        "state_code": data.state_code,
+        "court_complex_code": data.court_complex_code,
+        "rgyear": data.diary_year,
+        "case_type": caseTy,
+        "dist_code": data.dist_code,
+        "CNRNumber": case_data.get("CNR Number", ""),
+        "CaseStatus": re.match(r"([A-Z\s]+)\s*\(", status_data.get("Status/Stage", "")).group(1).strip() if re.match(r"([A-Z\s]+)\s*\(", status_data.get("Status/Stage", "")) else None,
+        "CaseType": caseTy,
+        "CourtNumberandJudge": judge_match.group(2).replace("and", ", ") if judge_match else None,
+        "DecisionDate": None,
+        "FilingNumber": data.diary_no + "/" + data.diary_year,
+        "NatureofDisposal": None,
+        "RegistrationNumber": data.diary_no + "/" + data.diary_year,
+        "actsandSection": {
+            "acts": status_data.get("Category", ""),
+            "section": None
+        },
+        "case_history": [],
+        "case_no": data.diary_no,
+        "courtType": "sci",
+        "court_code": data.court_complex_code,
+        "orders": [],
+        "petitioner_and_advocate": parties.get("petitioner", []),
+        "respondent_and_advocate": parties.get("respondent", []),
     }
     return result
+
 
 @app.post("/sci/getcaseInfo")
 def fetch_submit_info(case_data: CaseRequest):
@@ -198,7 +214,7 @@ def fetch_submit_info(case_data: CaseRequest):
         response_json = response.json()
         data_value = response_json.get("data")
         if not data_value or "No records found" in str(data_value):
-           return JSONResponse(content={"error": "Invalid Case Details"}, status_code=404)
+            return JSONResponse(content={"error": "Invalid Case Details"}, status_code=404)
 
         listing_response = session.get(BASE_URL, params={
             'diary_no': case_data.diary_no,
@@ -283,13 +299,12 @@ def fetch_submit_info(case_data: CaseRequest):
         session.close()
 
 
-@app.post("/sci/bulk_i/aor")
+@app.post("/sci/bulk_q/aor")
 def fetch_submit_info(case_data: CaseRequestAOR):
     session = requests.Session()
 
     try:
         for attempt in range(1, MAX_RETRIES + 1):
-            print(f"Captcha attempt {attempt}")
 
             lambda_payload = {
                 "image_url": "https://www.sci.gov.in/?_siwp_captcha&id=hojd0afgm07crqxwenrybr345qnurmjr1iu1mvgm",
@@ -310,7 +325,6 @@ def fetch_submit_info(case_data: CaseRequestAOR):
                 continue
 
             result_captcha = eval(expression)
-            print("Solved captcha:", result_captcha)
 
             payload = {
                 "party_type": "any",
@@ -331,9 +345,8 @@ def fetch_submit_info(case_data: CaseRequestAOR):
 
             response = session.get(BASE_URL, params=payload, headers=headers)
             response_json = response.json()
-        
-            if response_json.get("success") is False :
-                print("Captcha incorrect, retrying...")
+
+            if response_json.get("success") is False:
                 continue
 
             data_value = response_json.get("data")
@@ -343,10 +356,10 @@ def fetch_submit_info(case_data: CaseRequestAOR):
                     status_code=404
                 )
             data_value = response_json.get("data", {}).get("resultsHtml")
-            cases = extract_case_data(data_value)
+            cases = extract_case_data(data_value, case_data.case_status)
             return JSONResponse(content={
-                "success" : True,
-                "data" : cases
+                "success": True,
+                "data": cases
             }, status_code=200)
 
         return JSONResponse(
