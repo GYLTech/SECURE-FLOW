@@ -1,60 +1,57 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+
+from fastapi import APIRouter, Query
+import requests_cache
 from bs4 import BeautifulSoup
-import httpx
-from urllib.parse import quote
-import uvicorn
-import re
 
-app = FastAPI(title="AFT Case Diary Scraper")
+router = APIRouter()
 
-class DiaryRequest(BaseModel):
-    diary_no: str
+session = requests_cache.CachedSession(
+    cache_name="aft_cache",
+    backend="sqlite",
+    expire_after=3600,
+)
 
-def to_camel_case(s: str) -> str:
-    """
-    Converts a string to camelCase.
-    Example: "Petitioner Name" -> "petitionerName"
-    """
-    s = re.sub(r"[^\w\s]", "", s)  # remove punctuation
-    parts = s.strip().split()
-    if not parts:
-        return ""
-    return parts[0].lower() + "".join(word.capitalize() for word in parts[1:])
+BASE_URL = "http://aftpb.org/aft/views/diary_cases.php"
 
-@app.post("/scrape-diary")
-async def scrape_diary(data: DiaryRequest):
-    encoded_diary = quote(data.diary_no, safe="")
-    url = f"http://aftpb.org/aft/views/diary_cases.php?diary_no={encoded_diary}&results_per_page=1"
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        try:
-            response = await client.get(url)
-            response.raise_for_status()
-        except httpx.RequestError as e:
-            raise HTTPException(status_code=500, detail=f"Network error: {e}")
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=f"Failed to fetch page: {e}")
+@router.get("/aft")
+def get_aft_case(diary_no: str = Query(..., description="Full diary number, e.g., 1185/2026")):
+   
+    
+    params = {
+        "diary_no": diary_no,
+        "date_of_presentation": "",
+        "presented_by": "",
+        "results_per_page": "50"
+    }
 
-    soup = BeautifulSoup(response.text, "html.parser")
+    response = session.get(BASE_URL, params=params)
+    soup = BeautifulSoup(response.text, "lxml")
+    table = soup.find("table")
 
-    table = soup.find("table", {"class": "table"})
     if not table:
-        raise HTTPException(status_code=404, detail="Could not find data table on page")
+        return {"status": False, "message": f"No data found for diary number {diary_no}"}
 
-    headers = [th.get_text(strip=True) for th in table.find("thead").find_all("th")]
-    headers = [h for h in headers if h.lower() not in ["actions", "status"]]
-    headers_camel = [to_camel_case(h) for h in headers]
+    rows = table.find_all("tr")
+    data = []
 
-    rows = []
-    for tr in table.find("tbody").find_all("tr"):
-        cells = [td.get_text(strip=True) for td in tr.find_all("td")]
-        cell_values = cells[:len(headers_camel)]
-        row_data = dict(zip(headers_camel, cell_values))
-        rows.append(row_data)
+    for row in rows:
+        cols = [col.get_text(strip=True) for col in row.find_all("td")]
+        if cols and cols[0] == diary_no:  
+            data.append({
+                "diary_no": cols[0],
+                "date": cols[1],
+                "document_type": cols[2],
+                "oa_no": cols[3],
+                "presented_by": cols[4]
+            })
 
-    return {"diaryNo": data.diary_no, "results": rows}
+    if not data:
+        return {"status": False, "message": f"No case found for diary number {diary_no}"}
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    return {
+        "status": True,
+        "from_cache": getattr(response, "from_cache", False),
+        "total_rows": len(data),
+        "data": data
+    }
