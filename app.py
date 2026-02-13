@@ -22,7 +22,6 @@ app.include_router(cc.app, prefix="/api/v1", tags=["Consumer"])
 app.include_router(nclt.app, prefix="/api/v1", tags=["Nclt"])
 app.include_router(sci.app, prefix="/api/v1", tags=["Sci"])
 app.include_router(drt.app, prefix="/api/v1", tags=["drt"])
-# app.include_router(aft.app, prefix="/api/v1", tags=["aft"])
 app.include_router(aft.router, prefix="/api/v1", tags=["AFT"])
 
 
