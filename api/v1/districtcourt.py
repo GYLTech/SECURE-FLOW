@@ -44,12 +44,20 @@ class CaseRequestBulkIngest(BaseModel):
     state_code: str
     dist_code: str
     court_complex_code: str
-    case_no: str
-    cino: str
     est_code: Optional[str] = None
     rgyear: str
     courtType: Optional[str] = None
+    caselist_date: str
+    advocate_name: str
+    case_status: str
+    radAdvt: str = "1"          # default value
+    adv_bar_state: Optional[str] = None
+    adv_bar_code: Optional[str] = None
+    adv_bar_year: Optional[str] = None
+    case_type: Optional[str] = None
+    ajax_req: str = "true"      # default value
 
+    
 def sanitize_key(key):
     key = re.sub(r'[.$]', '', key)
     key = key.replace(':', '').replace(' ', '')
@@ -91,7 +99,16 @@ def fetch_submit_info(case_data: CaseRequest):
         "case_type": query.get("case_type"),
         "state_code": query.get("state_code"),
         "dist_code": query.get("dist_code"),
-        "court_complex_code": query.get("court_complex_code")
+        "court_complex_code": query.get("court_complex_code"),
+         
+        "court_code": query.get("court_code"),
+        "case_no": query.get("case_no"),
+        "cino": query.get("cino"),
+        "search_flag": "CScaseNumber",
+        "search_by": "CScaseNumber",
+        "ajax_req": "true",
+        
+        
     }
     if case_data.refresh_flag != "1":
         existing_case = collection.find_one(ac_query)
@@ -520,6 +537,376 @@ def fetch_submit_info(case_data: CaseRequestBulk):
         session.close()
 
 @app.post("/dc/bulk_i/partyname")
+def fetch_submit_info(single_case: CaseRequestBulkIngest):
+    try:
+        session = requests.Session()
+        query = single_case.dict()
+        ac_query = {
+            "cino": query.get("cino"),
+            "rgyear": query.get("rgyear"),
+            "est_code": query.get("est_code"),
+            "case_type": query.get("case_type"),
+            "state_code": query.get("state_code"),
+            "dist_code": query.get("dist_code"),
+            "court_complex_code": query.get("court_complex_code")
+        }
+        existing_case = collection.find_one(ac_query)
+        if existing_case:
+            existing_case["_id"] = str(existing_case["_id"])
+            existing_id = str(existing_case["_id"]) if existing_case else None
+
+        case_info = {
+            "case_no": single_case.case_no,
+            "cino": single_case.cino,
+            "court_code": single_case.court_code,
+            "state_code": single_case.state_code,
+            "dist_code": single_case.dist_code,
+            "court_complex_code": single_case.court_complex_code,
+            "est_code": single_case.est_code or None,
+            "rgyear": single_case.rgyear,
+            "courtType": single_case.courtType
+        }
+
+        second_payload = {
+            "court_code": str(case_info.get("court_code", "")),
+            "state_code": str(case_info.get("state_code", "")),
+            "dist_code": str(case_info.get("dist_code", "")),
+            "court_complex_code": str(case_info.get("court_complex_code", "")),
+            "case_no": str(case_info.get("case_no", "")),
+            "cino": str(case_info.get("cino", "")),
+            "rgyear": str(case_info.get("rgyear", "")),
+            "search_flag": "CScaseNumber",
+            "search_by": "CScaseNumber",
+            "ajax_req": "true",
+        }
+        if case_info.get("est_code") is not None:
+            second_payload["est_code"] = str(case_info["est_code"])
+        second_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=home/viewHistory"
+        second_response = safe_post(session,second_url, second_payload)
+
+        if second_response.status_code != 200:
+            print("❌ Failed request for", case_info["cino"])
+            return JSONResponse(content={"error": "Failed request"}, status_code=500)
+
+        case_details = second_response.json()
+        soup = BeautifulSoup(case_details.get("data_list", ""), "html.parser")
+
+        def sanitize_keys(data):
+            clean_data = {}
+            for key, value in data.items():
+                clean_key = key.replace('.', '').replace('$', '')
+                if isinstance(value, dict):
+                    clean_data[clean_key] = sanitize_keys(value)
+                else:
+                    clean_data[clean_key] = value
+            return clean_data
+
+        def extract_table_data(table_class):
+            table = soup.find("table", {"class": table_class})
+            data = {}
+            if table:
+                rows = table.find_all("tr")
+                for row in rows:
+                    cells = row.find_all("td")
+                    if len(cells) >= 2:
+                        key = cells[0].get_text(strip=True).replace(':', '').replace(' ', '')
+                        value = cells[1].get_text(strip=True)
+                        data[key] = value
+            return sanitize_keys(data)
+
+        def extract_list_data(table_class):
+            table = soup.find("table", {"class": table_class})
+            values = []
+            if table:
+                cell = table.find("td")
+                if cell:
+                    values = [line.strip() for line in cell.stripped_strings if line.strip()]
+            return values
+
+        def extract_fir_details(table_class):
+            table = soup.find("table", class_=lambda x: x and table_class in x)
+            details = {}
+            if table:
+                rows = table.find_all("tr")
+                for row in rows:
+                    cols = row.find_all("td")
+                    if len(cols) == 2:
+                        key = cols[0].get_text(strip=True).replace(" ", "")
+                        value = cols[1].get_text(strip=True)
+                        details[key] = value
+            return details
+
+        def extract_case_history():
+            table = soup.find("table", {"class": "history_table"})
+            rows = table.find_all("tr") if table else []
+            history = []
+            for row in rows:
+                cols = row.find_all("td")
+                if len(cols) >= 4:
+                    history.append({
+                        "judge": cols[0].text.strip(),
+                        "businessOnDate": cols[1].find("a").text.strip() if cols[1].find("a") else "",
+                        "hearingDate": cols[2].text.strip(),
+                        "purpose": cols[3].text.strip(),
+                        "inputType": "automatic",
+                        "lawyerRemark": "null"
+                    })
+            return history or []
+
+        def extract_case_transfer():
+            table = soup.find("table", {"class": "transfer_table table"})
+            transfers = []
+            if table:
+                rows = table.find_all("tr")[1:]
+                for row in rows:
+                    cols = row.find_all("td")
+                    if len(cols) >= 4:
+                        transfers.append({
+                            "registrationNumber": cols[0].text.strip(),
+                            "transferDate": cols[1].text.strip(),
+                            "fromCourt": cols[2].text.strip(),
+                            "toCourt": cols[3].text.strip(),
+                            "inputType": "automatic",
+                            "lawyerRemark": None
+                        })
+            return transfers
+
+        case_status = extract_table_data("table case_status_table table-bordered")
+        case_details_data = extract_table_data("table case_details_table table-bordered")
+        case_petitioner = {"petitioner_and_advocate": extract_list_data("table table-bordered Petitioner_Advocate_table")}
+        case_respondent = {"respondent_and_advocate": extract_list_data("table table-bordered Respondent_Advocate_table")}
+        case_fir_details = {"fir_details": extract_fir_details("FIR_details_table")}
+        acts_and_sections = {"actsandSection": {"acts": "null", "section": "null"}}
+
+        act_table = soup.find("table", {"class": "table acts_table table-bordered"})
+        if act_table:
+            rows = act_table.find_all("tr")[1:]
+            for row in rows:
+                cells = row.find_all("td")
+                if len(cells) == 2:
+                    acts_and_sections["actsandSection"] = {
+                        "acts": cells[0].get_text(strip=True),
+                        "section": cells[1].get_text(strip=True)
+                    }
+
+        case_history = {"case_history": extract_case_history()}
+        case_transfer = {"case_transfer": extract_case_transfer()}
+
+        orders = []
+        order_table = soup.find("table", {"class": "order_table"})
+
+        if order_table:
+            rows = order_table.find_all("tr")[1:]
+            app_token = case_details.get("app_token", "")
+
+            for row in rows:
+                cols = row.find_all("td")
+                if len(cols) < 3:
+                    continue
+
+                order_number = cols[0].text.strip()
+                order_date = cols[1].text.strip()
+
+                all_links = cols[2].find_all("a")
+                valid_link = None
+
+                for a in all_links:
+                    onclick = a.get("onclick", "")
+                    if re.search(r"displayPdf\((.*?)\)", onclick):
+                        valid_link = a
+                        break
+
+                if not valid_link:
+                    continue
+
+                onclick_attr = valid_link.get("onclick", "")
+                match = re.search(r"displayPdf\((.*?)\)", onclick_attr)
+                if not match:
+                    continue
+
+                values = [v.strip().strip("'") for v in match.group(1).split(",")]
+                if len(values) < 4:
+                    continue
+
+                normal_v = values[0]
+                case_val = values[1]
+                court_code = values[2]
+                filename = values[3]
+                app_flag = values[4] if len(values) > 4 else ""
+
+                order_payload = {
+                    "normal_v": normal_v,
+                    "case_val": case_val,
+                    "court_code": court_code,
+                    "filename": filename,
+                    "appFlag": app_flag,
+                    "ajax_req": "true",
+                    "app_token": app_token
+                }
+
+                full_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=home/display_pdf"
+                order_response = safe_post(session,full_url, order_payload)
+
+                try:
+                    token_update = order_response.json()
+                    new_app_token = token_update.get("app_token")
+                    if new_app_token:
+                        app_token = new_app_token
+                except:
+                    pass
+
+                order_response_data = order_response.json()
+                pdf_file_path = order_response_data.get("order", "").replace("\\", "")
+                if not pdf_file_path:
+                    continue
+
+                final_pdf_url = f"https://services.ecourts.gov.in/ecourtindia_v6/{pdf_file_path}"
+
+                s3_folder_path = f"case_data/orders/{case_info['cino']}/"
+                s3_file_path = f"{s3_folder_path}{case_info['cino']}-{order_number}.pdf"
+                
+
+                try:
+                    s3_client.head_object(Bucket=BUCKET_NAME, Key=s3_file_path)
+                    s3_url = f"https://{BUCKET_NAME}.s3.{REGION_NAME}.amazonaws.com/{s3_file_path}"
+                except s3_client.exceptions.ClientError as e:
+                    if e.response['Error']['Code'] == "404":
+                        response = session.get(final_pdf_url, stream=True)
+                        if response.status_code == 200:
+                            s3_client.upload_fileobj(
+                                response.raw,
+                                BUCKET_NAME,
+                                s3_file_path,
+                                ExtraArgs={
+                                    'ContentType': 'application/pdf',
+                                    'ContentDisposition': 'inline'
+                                }
+                            )
+                            s3_url = f"https://{BUCKET_NAME}.s3.{REGION_NAME}.amazonaws.com/{s3_file_path}"
+                        else:
+                            s3_url = None
+                    else:
+                        s3_url = None
+
+                orders.append({
+                    "order_number": order_number,
+                    "order_date": order_date,
+                    "order_link": s3_url
+                })
+
+        final_response = {
+            **case_info,
+            **case_fir_details,
+            **case_details_data,
+            **case_status,
+            **case_petitioner,
+            **case_respondent,
+            **acts_and_sections,
+            **case_history,
+            **case_transfer,
+            "orders": orders
+        }
+
+        result = collection.update_one(ac_query, {"$set": final_response}, upsert=True)
+        if result.upserted_id:
+            final_response["_id"] = str(result.upserted_id)
+        else:
+            if existing_id:
+                final_response["_id"] = existing_id
+            else:
+                doc = collection.find_one(ac_query)
+                final_response["_id"] = str(doc["_id"])
+
+        return JSONResponse(content={"data": final_response}, status_code=200)
+
+    finally:
+        session.close()
+
+@app.post("/dc/bulk_q/advocatename")
+def fetch_submit_info(case_data: CaseRequestBulkIngest):
+    session = requests.Session()
+    case_info = {}
+
+    try:
+        payload = {
+                "radAdvt": case_data.radAdvt,
+                "advocate_name": case_data.advocate_name,
+                "adv_bar_state": case_data.adv_bar_state,
+                "adv_bar_code": case_data.adv_bar_code,
+                "adv_bar_year": case_data.adv_bar_year,
+                "case_status": case_data.case_status,
+                "caselist_date": case_data.caselist_date ,
+                "state_code": case_data.state_code,
+                "dist_code": case_data.dist_code,
+                "court_complex_code": case_data.court_complex_code,
+                "est_code": case_data.est_code,
+                "case_type": case_data.case_type,
+                "ajax_req": case_data.ajax_req
+                }
+
+
+        search_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=casestatus/submitAdvName"
+        response = safe_post(session,search_url,payload)
+        
+        print(response.text)
+
+        html_content = response.json().get("party_data", "")
+
+        if "Record not found" in html_content:
+            return JSONResponse(content={"error": "Invalid case details"}, status_code=404)
+
+        soup = BeautifulSoup(html_content, "html.parser")
+        view_link = soup.find("a", class_="someclass")
+        rows = soup.find_all("tr")
+
+        results = []
+        for row in rows:
+            cols = row.find_all("td")
+            if len(cols) < 3:
+                continue
+
+            case_number = cols[1].get_text(strip=True)
+            party_details = cols[2].get_text(" ", strip=True)
+            party_details = re.sub(
+                r"\s*Vs\.?\s*", " Vs ", party_details, flags=re.IGNORECASE)
+            party_details = re.sub(r"\s+", " ", party_details).strip()
+
+            view_link = row.find("a", class_="someclass")
+            if not view_link:
+                continue
+
+            onClick_data = view_link.get("onclick", "")
+            match = re.search(r"viewHistory\((.*?)\)", onClick_data)
+
+            if not match:
+                continue
+
+            params = match.group(1)
+            values = [v.strip().strip("'") for v in params.split(",")]
+
+            case_info = {
+                "case_no": values[0],
+                "cino": values[1],
+                "court_code": values[2] or None,
+                "state_code": values[5] or None,
+                "dist_code": values[6] or None,
+                "court_complex_code": values[7] or None,
+                "est_code": case_data.est_code or None,
+                "rgyear": case_data.rgyearP,
+                "case_number": case_number,
+                "party_details": party_details,
+                "courtType": case_data.courtType
+            }
+
+            results.append(case_info)
+
+        return JSONResponse(content={"data": results}, status_code=200)
+
+    finally:
+        session.close()
+        
+
+@app.post("/dc/bulk_i/advocatename")
 def fetch_submit_info(single_case: CaseRequestBulkIngest):
     try:
         session = requests.Session()
