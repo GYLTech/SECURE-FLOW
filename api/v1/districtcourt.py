@@ -1,3 +1,4 @@
+import json
 import random
 import time
 import requests
@@ -25,6 +26,7 @@ class CaseRequest(BaseModel):
     dist_code: str
     court_complex_code: str
     est_code: Optional[str] = None
+    courtType: Optional[str] = None
 
 class CaseRequestBulk(BaseModel):
     petres_name: str
@@ -47,6 +49,43 @@ class CaseRequestBulkIngest(BaseModel):
     rgyear: str
     courtType: Optional[str] = None
 
+
+def build_case_base_path(metadata: dict):
+    return (
+        f"cases/"
+        f"{metadata['courtType']}/"
+        f"{metadata['state_code']}/"
+        f"{metadata['dist_code']}/"
+        f"{metadata['court_complex_code']}/"
+        f"{metadata['rgyear']}/"
+        f"{metadata['cino']}/"
+    )
+
+def build_orders_prefix(metadata: dict):
+    return build_case_base_path(metadata) + "orders/"
+
+def build_case_json_key(metadata: dict):
+    return build_case_base_path(metadata) + "metadata.json"
+
+def upload_case_json_to_s3(
+    s3_client,
+    bucket_name,
+    metadata
+):
+    key = build_case_json_key(metadata)
+
+    payload = {
+        **metadata
+    }
+
+    s3_client.put_object(
+        Bucket=bucket_name,
+        Key=key,
+        Body=json.dumps(payload, ensure_ascii=False),
+        ContentType="application/json"
+    )
+
+    return f"s3://{bucket_name}/{key}"
 
 def safe_post(session, url, data, max_retries=3):
     for attempt in range(max_retries):
@@ -199,7 +238,7 @@ def extract_acts_and_sections(
 def fetch_and_store_orders(
     soup,
     session,
-    case_info,
+    metadata,
     case_details,
     s3_client,
     bucket_name,
@@ -208,6 +247,7 @@ def fetch_and_store_orders(
     pdf_endpoint="https://services.ecourts.gov.in/ecourtindia_v6/?p=home/display_pdf",
     pdf_base_url="https://services.ecourts.gov.in/ecourtindia_v6/"
 ):
+    orders_prefix = build_case_base_path(metadata) + "orders/"
     orders = []
     order_table = soup.find("table", {"class": table_class})
 
@@ -268,7 +308,7 @@ def fetch_and_store_orders(
             continue
 
         final_pdf_url = f"{pdf_base_url}{pdf_path}"
-        s3_key = f"case_data/orders/{case_info['cino']}/{case_info['cino']}-{order_number}.pdf"
+        s3_key = f"{orders_prefix}order-{order_number.zfill(3)}.pdf"
 
         try:
             s3_client.head_object(Bucket=bucket_name, Key=s3_key)
@@ -303,10 +343,9 @@ def fetch_and_store_orders(
 
 @app.post("/getcaseInfo")
 def fetch_submit_info(case_data: CaseRequest):
-    session = requests.Session()
     query = case_data.dict()
     ac_query = {
-        "court_type": query.get("court_type"),
+        "courtType": query.get("courtType"),
         "case_reg_no": query.get("case_reg_no"),
         "rgyear": query.get("rgyear"),
         "est_code": query.get("est_code"),
@@ -315,12 +354,12 @@ def fetch_submit_info(case_data: CaseRequest):
         "dist_code": query.get("dist_code"),
         "court_complex_code": query.get("court_complex_code")
     }
-    # if case_data.refresh_flag != "1":
-    #     existing_case = collection.find_one(ac_query)
-    #     if existing_case:
-    #         existing_case["_id"] = str(existing_case["_id"])
-    #         return JSONResponse(content=existing_case)
-
+    existing_case = collection.find_one(ac_query)
+    if existing_case:
+        existing_case["_id"] = str(existing_case["_id"])
+        return JSONResponse(content=existing_case)
+    
+    session = requests.Session()
     case_info = {}
 
     try:
@@ -365,7 +404,8 @@ def fetch_submit_info(case_data: CaseRequest):
                     "est_code": case_data.est_code,
                     "case_type": case_data.case_type,
                     "rgyear": case_data.rgyear,
-                    "case_reg_no": case_data.case_reg_no
+                    "case_reg_no": case_data.case_reg_no,
+                    "courtType" : case_data.courtType,
                 }
 
                 second_payload = {
@@ -406,26 +446,33 @@ def fetch_submit_info(case_data: CaseRequest):
                     case_history = {"case_history": extract_case_history(soup)}
                     case_transfer = {
                         "case_transfer": extract_case_transfer(soup)}
+
+                    metadata = {
+                      **case_info, **case_fir_details, **case_details, **case_status, **case_petitioner,
+                                      **case_respondent, **acts_and_sections, **case_history, **case_transfer  
+                    }
+
+                    case_json_s3_path = upload_case_json_to_s3(
+                    s3_client,"dl-shared-gyl-vidilekh",metadata
+                    )
+
                     orders = fetch_and_store_orders(
                         soup,
                         session,
-                        case_info,
+                        metadata,
                         case_details,
                         s3_client,
-                        BUCKET_NAME,
+                        "dl-shared-gyl-vidilekh",
                         REGION_NAME
                     )
 
-                    final_response = {**case_info, **case_fir_details, **case_details, **case_status, **case_petitioner,
-                                      **case_respondent, **acts_and_sections, **case_history, **case_transfer, "orders": orders}
 
-                    result = collection.update_one(
-                        ac_query, {"$set": final_response}, upsert=True)
-                    if result.upserted_id:
-                        final_response["_id"] = str(result.upserted_id)
-                    else:
-                        doc = collection.find_one(ac_query)
-                        final_response["_id"] = str(doc["_id"])
+                    final_response = {**case_info, **case_fir_details, **case_details, **case_status, **case_petitioner,
+                                      **case_respondent, **acts_and_sections, **case_history, **case_transfer,"s3_prefix" : case_json_s3_path, "orders": orders}
+
+                    
+                    insert_result = collection.insert_one(final_response)
+                    final_response["_id"] = str(insert_result.inserted_id)
 
                     return JSONResponse(content=final_response)
                 else:
@@ -516,9 +563,9 @@ def fetch_submit_info(case_data: CaseRequestBulk):
 @app.post("/dc/bulk_i/partyname")
 def fetch_submit_info(single_case: CaseRequestBulkIngest):
     try:
-        session = requests.Session()
         query = single_case.dict()
         ac_query = {
+            "courtType": "distcourts",
             "cino": query.get("cino"),
             "rgyear": query.get("rgyear"),
             "est_code": query.get("est_code"),
@@ -530,7 +577,9 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
         existing_case = collection.find_one(ac_query)
         if existing_case:
             existing_case["_id"] = str(existing_case["_id"])
-            existing_id = str(existing_case["_id"]) if existing_case else None
+            return JSONResponse(content=existing_case)
+        
+        session = requests.Session()
 
         case_info = {
             "case_no": single_case.case_no,
@@ -541,7 +590,7 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
             "court_complex_code": single_case.court_complex_code,
             "est_code": single_case.est_code or None,
             "rgyear": single_case.rgyear,
-            "courtType": single_case.courtType
+            "courtType": "distcourts"
         }
 
         second_payload = {
@@ -569,7 +618,7 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
         soup = BeautifulSoup(case_details.get("data_list", ""), "html.parser")
         case_status = extract_table_data(
             soup, "table case_status_table table-bordered")
-        case_details_data = extract_table_data(
+        case_details = extract_table_data(
             soup, "table case_details_table table-bordered")
         case_petitioner = {"petitioner_and_advocate": extract_list_data(
             soup, "table table-bordered Petitioner_Advocate_table")}
@@ -580,39 +629,29 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
         acts_and_sections = extract_acts_and_sections(soup)
         case_history = {"case_history": extract_case_history(soup)}
         case_transfer = {"case_transfer": extract_case_transfer(soup)}
+        metadata = {
+                      **case_info, **case_fir_details, **case_details, **case_status, **case_petitioner,
+                                      **case_respondent, **acts_and_sections, **case_history, **case_transfer  
+                    }
+        case_json_s3_path = upload_case_json_to_s3(
+        s3_client,"dl-shared-gyl-vidilekh",metadata
+        )
+        
         orders = fetch_and_store_orders(
             soup,
             session,
-            case_info,
+            metadata,
             case_details,
             s3_client,
-            BUCKET_NAME,
+            'dl-shared-gyl-vidilekh',
             REGION_NAME
         )
 
-        final_response = {
-            **case_info,
-            **case_fir_details,
-            **case_details_data,
-            **case_status,
-            **case_petitioner,
-            **case_respondent,
-            **acts_and_sections,
-            **case_history,
-            **case_transfer,
-            "orders": orders
-        }
-
-        # result = collection.update_one(
-        #     ac_query, {"$set": final_response}, upsert=True)
-        # if result.upserted_id:
-        #     final_response["_id"] = str(result.upserted_id)
-        # else:
-        #     if existing_id:
-        #         final_response["_id"] = existing_id
-        #     else:
-        #         doc = collection.find_one(ac_query)
-        #         final_response["_id"] = str(doc["_id"])
+        final_response = {**case_info, **case_fir_details, **case_details, **case_status, **case_petitioner,
+                                      **case_respondent, **acts_and_sections, **case_history, **case_transfer,"s3_prefix" : case_json_s3_path, "orders": orders}
+        
+        insert_result = collection.insert_one(final_response)
+        final_response["_id"] = str(insert_result.inserted_id)
 
         return JSONResponse(content={"data": final_response}, status_code=200)
 

@@ -28,11 +28,6 @@ class OrderItem(BaseModel):
     order_link: str
 
 
-class TimeSeriesEvent(BaseModel):
-    event_type: str
-    event_date: str
-    reference_id: str
-
 
 class CaseDocument(BaseModel):
     case_no: str
@@ -46,28 +41,22 @@ class CaseDocument(BaseModel):
     case_type: str
     rgyear: str
     case_reg_no: str
-
     fir_details: FIRDetails
     CaseType: str
     FilingNumber: str
     RegistrationNumber: str
     CNRNumber: str
     e_Filno: str = Field(alias="e-Filno")
-
     FirstHearingDate: str
     NextHearingDate: str
     CaseStage: str
     CourtNumberandJudge: str
-
     petitioner_and_advocate: List[str]
     respondent_and_advocate: List[str]
-
     actsandSection: ActsAndSection
     case_history: List[CaseHistoryItem]
     case_transfer: List[dict]
     orders: List[OrderItem]
-
-    time_series: List[TimeSeriesEvent]
 
     class Config:
         allow_population_by_field_name = True
