@@ -563,6 +563,7 @@ def fetch_submit_info(case_data: CaseRequestBulk):
 @app.post("/dc/bulk_i/partyname")
 def fetch_submit_info(single_case: CaseRequestBulkIngest):
     try:
+        session = requests.Session()
         query = single_case.dict()
         ac_query = {
             "courtType": "distcourts",
@@ -578,8 +579,6 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
         if existing_case:
             existing_case["_id"] = str(existing_case["_id"])
             return JSONResponse(content=existing_case)
-        
-        session = requests.Session()
 
         case_info = {
             "case_no": single_case.case_no,
