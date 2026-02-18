@@ -30,9 +30,7 @@ class CaseRequest(BaseModel):
 
 
 class CaseRequestBulk(BaseModel):
-    cino: str
     petres_name: str
-    case_no: str
     rgyearP: str
     case_status: str
     state_code: str
@@ -42,24 +40,22 @@ class CaseRequestBulk(BaseModel):
     courtType: Optional[str] = None
 
 class CaseRequestBulkIngest(BaseModel):
-    cino: Optional[str] = None
-    case_no: Optional[str] = None
     court_code: str
     state_code: str
     dist_code: str
     court_complex_code: str
     est_code: Optional[str] = None
-    rgyear: Optional[str] = None
+    rgyear: str
     courtType: Optional[str] = None
-    caselist_date: Optional[str] = None
-    advocate_name: Optional[str] = None
-    case_status: Optional[str] = None
-    radAdvt: str = "1"          
+    caselist_date: str
+    advocate_name: str
+    case_status: str
+    radAdvt: str = "1"          # default value
     adv_bar_state: Optional[str] = None
     adv_bar_code: Optional[str] = None
     adv_bar_year: Optional[str] = None
     case_type: Optional[str] = None
-    ajax_req: str = "true"   
+    ajax_req: str = "true"      # default value
 
     
 def sanitize_key(key):
@@ -93,9 +89,6 @@ def safe_post(session, url, data, max_retries=3):
     raise Exception("❌ eCourts viewHistory failed after retries")
 
 @app.post("/getcaseInfo")
-
-
-
 def fetch_submit_info(case_data: CaseRequest):
     session = requests.Session()
     query = case_data.dict()
@@ -138,7 +131,7 @@ def fetch_submit_info(case_data: CaseRequest):
             'search_case_no': case_data.case_reg_no,
         }
 
-        search_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=casestatus/submitAdvName"
+        search_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=casestatus/submitCaseNo"
         response = safe_post(session,search_url, payload)
 
         html_content = response.json().get("case_data", "")
@@ -186,7 +179,6 @@ def fetch_submit_info(case_data: CaseRequest):
 
                 second_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=home/viewHistory"
 
-                
                 second_response = safe_post(session,second_url, second_payload)
                 print("second response",second_response.text)
 
@@ -545,7 +537,7 @@ def fetch_submit_info(case_data: CaseRequestBulk):
         session.close()
 
 @app.post("/dc/bulk_i/partyname")
-def fetch_submit_info(single_case: CaseRequestBulk):
+def fetch_submit_info(single_case: CaseRequestBulkIngest):
     try:
         session = requests.Session()
         query = single_case.dict()
@@ -583,6 +575,9 @@ def fetch_submit_info(single_case: CaseRequestBulk):
             "case_no": str(case_info.get("case_no", "")),
             "cino": str(case_info.get("cino", "")),
             "rgyear": str(case_info.get("rgyear", "")),
+            "case_no": str,
+            "cino": str,
+
             "search_flag": "CScaseNumber",
             "search_by": "CScaseNumber",
             "ajax_req": "true",
@@ -830,64 +825,45 @@ def fetch_submit_info(single_case: CaseRequestBulk):
     finally:
         session.close()
 
-        
-        
-        
-
-
 @app.post("/dc/bulk_q/advocatename")
 def fetch_submit_info(case_data: CaseRequestBulkIngest):
     session = requests.Session()
+    case_info = {}
 
     try:
         payload = {
-            "radAdvt": case_data.radAdvt,
-            "advocate_name": case_data.advocate_name,
-            "adv_bar_state": case_data.adv_bar_state,
-            "adv_bar_code": case_data.adv_bar_code,
-            "adv_bar_year": case_data.adv_bar_year,
-            "case_status": case_data.case_status,
-            "caselist_date": case_data.caselist_date,
-            "state_code": case_data.state_code,
-            "dist_code": case_data.dist_code,
-            "court_complex_code": case_data.court_complex_code,
-            "est_code": case_data.est_code,
-            "case_type": case_data.case_type,
-            "ajax_req": case_data.ajax_req
-        }
+                "radAdvt": case_data.radAdvt,
+                "advocate_name": case_data.advocate_name,
+                "adv_bar_state": case_data.adv_bar_state,
+                "adv_bar_code": case_data.adv_bar_code,
+                "adv_bar_year": case_data.adv_bar_year,
+                "case_status": case_data.case_status,
+                "caselist_date": case_data.caselist_date ,
+                "state_code": case_data.state_code,
+                "dist_code": case_data.dist_code,
+                "court_complex_code": case_data.court_complex_code,
+                "est_code": case_data.est_code,
+                "case_type": case_data.case_type,
+                "ajax_req": case_data.ajax_req
+
+                }
+
 
         search_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=casestatus/submitAdvName"
-        response = safe_post(session, search_url, payload)
+        response = safe_post(session,search_url,payload)
+        
+        print(response.text)
 
-        result = {}
-
-        try:
-            json_data = response.json()
-            result["response_type"] = "json"
-
-            html_content = json_data.get("party_data", "")
-            if html_content:
-                result["embedded_html"] = True
-            else:
-                return JSONResponse(content=json_data, status_code=200)
-
-        except ValueError:
-            
-            
-            result["response_type"] = "html"
-            html_content = response.text
-
-        if not html_content or "Record not found" in html_content:
-            return JSONResponse(
-                content={"error": "Invalid case details"},
-                status_code=404
-            )
+        
+        html_content = response.json().get("party_data", "")
+        if "Record not found" in html_content:
+            return JSONResponse(content={"error": "Invalid case details"}, status_code=404)
 
         soup = BeautifulSoup(html_content, "html.parser")
-
-        results = []
+        view_link = soup.find("a", class_="someclass")
         rows = soup.find_all("tr")
 
+        results = []
         for row in rows:
             cols = row.find_all("td")
             if len(cols) < 3:
@@ -895,63 +871,58 @@ def fetch_submit_info(case_data: CaseRequestBulkIngest):
 
             case_number = cols[1].get_text(strip=True)
             party_details = cols[2].get_text(" ", strip=True)
-            party_details = re.sub(r"\s*Vs\.?\s*", " Vs ", party_details, flags=re.IGNORECASE)
+            party_details = re.sub(
+                r"\s*Vs\.?\s*", " Vs ", party_details, flags=re.IGNORECASE)
             party_details = re.sub(r"\s+", " ", party_details).strip()
 
-            view_link = row.find("a")
+            view_link = row.find("a", class_="someclass")
             if not view_link:
                 continue
 
             onClick_data = view_link.get("onclick", "")
             match = re.search(r"viewHistory\((.*?)\)", onClick_data)
+
             if not match:
                 continue
 
-            values = [v.strip().strip("'") for v in match.group(1).split(",")]
+            params = match.group(1)
+            values = [v.strip().strip("'") for v in params.split(",")]
 
             case_info = {
-                "case_no": values[0] if len(values) > 0 else None,
-                "cino": values[1] if len(values) > 1 else None,
-                "court_code": values[2] if len(values) > 2 else None,
-                "state_code": values[5] if len(values) > 5 else None,
-                "dist_code": values[6] if len(values) > 6 else None,
-                "court_complex_code": values[7] if len(values) > 7 else None,
-                "est_code": case_data.est_code,
-                "rgyear": getattr(case_data, "rgyear", None),
+                "case_no": values[0],
+                "cino": values[1],
+                "court_code": values[2] or None,
+                "state_code": values[5] or None,
+                "dist_code": values[6] or None,
+                "court_complex_code": values[7] or None,
+                "est_code": case_data.est_code or None,
+                "rgyear": case_data.rgyear,
                 "case_number": case_number,
                 "party_details": party_details,
-                "courtType": getattr(case_data, "courtType", None)
+                "courtType": case_data.courtType
             }
 
             results.append(case_info)
 
-        return JSONResponse(
-            content={
-                "response_type": result.get("response_type"),
-                "data": results
-            },
-            status_code=200
-        )
+        return JSONResponse(content={"data": results}, status_code=200)
 
     finally:
         session.close()
-
+        
 
 @app.post("/dc/bulk_i/advocatename")
 def fetch_submit_info(single_case: CaseRequestBulkIngest):
     try:
         session = requests.Session()
-        
         query = single_case.dict()
         ac_query = {
-            
             "cino": query.get("cino"),
             "rgyear": query.get("rgyear"),
             "est_code": query.get("est_code"),
             "case_type": query.get("case_type"),
             "state_code": query.get("state_code"),
             "dist_code": query.get("dist_code"),
-            "court_complex_code": query.get("court_complex_code"),
+            "court_complex_code": query.get("court_complex_code")
         }
         existing_case = collection.find_one(ac_query)
         if existing_case:
@@ -959,25 +930,19 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
             existing_id = str(existing_case["_id"]) if existing_case else None
 
         case_info = {
-            "radAdvt": single_case.radAdvt,
+            "case_no": single_case.case_no,
             "cino": single_case.cino,
-            "advocate_name": single_case.advocate_name,
-            "court_complex_code": single_case.court_complex_code,
-            "case_status": single_case.case_status,
-            "caselist_date": single_case.caselist_date,
+            "court_code": single_case.court_code,
             "state_code": single_case.state_code,
             "dist_code": single_case.dist_code,
-            "court_code": single_case.court_code ,
+            "court_complex_code": single_case.court_complex_code,
+            "est_code": single_case.est_code or None,
             "rgyear": single_case.rgyear,
-            "case_no": single_case.case_no,
-            "ajax_req": single_case.ajax_req
-
+            "courtType": single_case.courtType
         }
 
         second_payload = {
-            "radAdvt": str(case_info.get("radAdvt", "")),
             "court_code": str(case_info.get("court_code", "")),
-            "advocate_name": str(case_info.get("advocate_name", "")),
             "state_code": str(case_info.get("state_code", "")),
             "dist_code": str(case_info.get("dist_code", "")),
             "court_complex_code": str(case_info.get("court_complex_code", "")),
@@ -988,38 +953,22 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
             "search_by": "CScaseNumber",
             "ajax_req": "true",
         }
-        
         if case_info.get("est_code") is not None:
             second_payload["est_code"] = str(case_info["est_code"])
         second_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=home/viewHistory"
         second_response = safe_post(session,second_url, second_payload)
-        print(second_response)
 
         if second_response.status_code != 200:
             print("❌ Failed request for", case_info["cino"])
             return JSONResponse(content={"error": "Failed request"}, status_code=500)
 
         # case_details = second_response.json()
-        # soup = BeautifulSoup(case_details.get("data_list", ""), "html.parser")
-
-
-
         try:
             case_details = second_response.json()
-            html_content = case_details.get("data_list", "")
         except ValueError:
-    # If not JSON, assume raw HTML returned
-            html_content = second_response.text
+            JSONResponse(content={"error": "Invalid JSON response"}, status_code=500)
 
-        if not html_content:
-            return JSONResponse(
-            content={"error": "Empty response from eCourts"},
-            status_code=500
-            )
-
-        soup = BeautifulSoup(html_content, "html.parser")
-
-
+        soup = BeautifulSoup(case_details.get("data_list", ""), "html.parser")
 
         def sanitize_keys(data):
             clean_data = {}
@@ -1225,7 +1174,6 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
                 })
 
         final_response = {
-            
             **case_info,
             **case_fir_details,
             **case_details_data,
@@ -1237,10 +1185,7 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
             **case_transfer,
             "orders": orders
         }
-        
-        print(final_response)
 
-        
         result = collection.update_one(ac_query, {"$set": final_response}, upsert=True)
         if result.upserted_id:
             final_response["_id"] = str(result.upserted_id)
@@ -1255,4 +1200,3 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
 
     finally:
         session.close()
-

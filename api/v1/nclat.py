@@ -8,7 +8,7 @@ import re
 from pydantic import BaseModel
 from typing import List, Optional
 from dotenv import load_dotenv
-from core.database import collection
+# from core.database import collection
 from core.s3_client import s3_client
 import os
 from http.client import RemoteDisconnected
@@ -54,12 +54,12 @@ class CaseRequestBulkIngest(BaseModel):
     caselist_date: Optional[str] = None
     advocate_name: Optional[str] = None
     case_status: Optional[str] = None
-    radAdvt: str = "1"          
+    radAdvt: str = "1"          # default value
     adv_bar_state: Optional[str] = None
     adv_bar_code: Optional[str] = None
     adv_bar_year: Optional[str] = None
     case_type: Optional[str] = None
-    ajax_req: str = "true"   
+    ajax_req: str = "true"      # default value
 
     
 def sanitize_key(key):
@@ -186,6 +186,7 @@ def fetch_submit_info(case_data: CaseRequest):
 
                 second_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=home/viewHistory"
 
+                # second_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=casestatus/submitAdvName"
                 
                 second_response = safe_post(session,second_url, second_payload)
                 print("second response",second_response.text)
@@ -830,6 +831,88 @@ def fetch_submit_info(single_case: CaseRequestBulk):
     finally:
         session.close()
 
+# @app.post("/dc/bulk_q/advocatename")
+# def fetch_submit_info(case_data: CaseRequestBulkIngest):
+#     session = requests.Session()
+#     case_info = {}
+
+#     try:
+#         payload = {
+#                 "radAdvt": case_data.radAdvt,
+#                 "advocate_name": case_data.advocate_name,
+#                 "adv_bar_state": case_data.adv_bar_state,
+#                 "adv_bar_code": case_data.adv_bar_code,
+#                 "adv_bar_year": case_data.adv_bar_year,
+#                 "case_status": case_data.case_status,
+#                 "caselist_date": case_data.caselist_date ,
+#                 "state_code": case_data.state_code,
+#                 "dist_code": case_data.dist_code,
+#                 "court_complex_code": case_data.court_complex_code,
+#                 "est_code": case_data.est_code,
+#                 "case_type": case_data.case_type,
+#                 "ajax_req": case_data.ajax_req
+#                 }
+
+
+#         search_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=casestatus/submitAdvName"
+#         response = safe_post(session,search_url,payload)
+        
+#         print(response.text)
+
+#         html_content = response.json().get("party_data", "")
+
+#         if "Record not found" in html_content:
+#             return JSONResponse(content={"error": "Invalid case details"}, status_code=404)
+
+#         soup = BeautifulSoup(html_content, "html.parser")
+#         view_link = soup.find("a", class_="someclass")
+#         rows = soup.find_all("tr")
+
+#         results = []
+#         for row in rows:
+#             cols = row.find_all("td")
+#             if len(cols) < 3:
+#                 continue
+
+#             case_number = cols[1].get_text(strip=True)
+#             party_details = cols[2].get_text(" ", strip=True)
+#             party_details = re.sub(
+#                 r"\s*Vs\.?\s*", " Vs ", party_details, flags=re.IGNORECASE)
+#             party_details = re.sub(r"\s+", " ", party_details).strip()
+
+#             view_link = row.find("a", class_="someclass")
+#             if not view_link:
+#                 continue
+
+#             onClick_data = view_link.get("onclick", "")
+#             match = re.search(r"viewHistory\((.*?)\)", onClick_data)
+
+#             if not match:
+#                 continue
+
+#             params = match.group(1)
+#             values = [v.strip().strip("'") for v in params.split(",")]
+
+#             case_info = {
+#                 "case_no": values[0],
+#                 "cino": values[1],
+#                 "court_code": values[2] or None,
+#                 "state_code": values[5] or None,
+#                 "dist_code": values[6] or None,
+#                 "court_complex_code": values[7] or None,
+#                 "est_code": case_data.est_code or None,
+#                 "rgyear": case_data.rgyearP,
+#                 "case_number": case_number,
+#                 "party_details": party_details,
+#                 "courtType": case_data.courtType
+#             }
+
+#             results.append(case_info)
+
+#         return JSONResponse(content={"data": results}, status_code=200)
+
+#     finally:
+#         session.close()
         
         
         
@@ -943,20 +1026,20 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
         session = requests.Session()
         
         query = single_case.dict()
-        ac_query = {
+        # ac_query = {
             
-            "cino": query.get("cino"),
-            "rgyear": query.get("rgyear"),
-            "est_code": query.get("est_code"),
-            "case_type": query.get("case_type"),
-            "state_code": query.get("state_code"),
-            "dist_code": query.get("dist_code"),
-            "court_complex_code": query.get("court_complex_code"),
-        }
-        existing_case = collection.find_one(ac_query)
-        if existing_case:
-            existing_case["_id"] = str(existing_case["_id"])
-            existing_id = str(existing_case["_id"]) if existing_case else None
+        #     "cino": query.get("cino"),
+        #     "rgyear": query.get("rgyear"),
+        #     "est_code": query.get("est_code"),
+        #     "case_type": query.get("case_type"),
+        #     "state_code": query.get("state_code"),
+        #     "dist_code": query.get("dist_code"),
+        #     "court_complex_code": query.get("court_complex_code"),
+        # }
+        # existing_case = collection.find_one(ac_query)
+        # if existing_case:
+        #     existing_case["_id"] = str(existing_case["_id"])
+        #     existing_id = str(existing_case["_id"]) if existing_case else None
 
         case_info = {
             "radAdvt": single_case.radAdvt,
@@ -1192,36 +1275,36 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
 
                 final_pdf_url = f"https://services.ecourts.gov.in/ecourtindia_v6/{pdf_file_path}"
 
-                s3_folder_path = f"case_data/orders/{case_info['cino']}/"
-                s3_file_path = f"{s3_folder_path}{case_info['cino']}-{order_number}.pdf"
+                # s3_folder_path = f"case_data/orders/{case_info['cino']}/"
+                # s3_file_path = f"{s3_folder_path}{case_info['cino']}-{order_number}.pdf"
                 
 
-                try:
-                    s3_client.head_object(Bucket=BUCKET_NAME, Key=s3_file_path)
-                    s3_url = f"https://{BUCKET_NAME}.s3.{REGION_NAME}.amazonaws.com/{s3_file_path}"
-                except s3_client.exceptions.ClientError as e:
-                    if e.response['Error']['Code'] == "404":
-                        response = session.get(final_pdf_url, stream=True)
-                        if response.status_code == 200:
-                            s3_client.upload_fileobj(
-                                response.raw,
-                                BUCKET_NAME,
-                                s3_file_path,
-                                ExtraArgs={
-                                    'ContentType': 'application/pdf',
-                                    'ContentDisposition': 'inline'
-                                }
-                            )
-                            s3_url = f"https://{BUCKET_NAME}.s3.{REGION_NAME}.amazonaws.com/{s3_file_path}"
-                        else:
-                            s3_url = None
-                    else:
-                        s3_url = None
+                # try:
+                #     s3_client.head_object(Bucket=BUCKET_NAME, Key=s3_file_path)
+                #     s3_url = f"https://{BUCKET_NAME}.s3.{REGION_NAME}.amazonaws.com/{s3_file_path}"
+                # except s3_client.exceptions.ClientError as e:
+                #     if e.response['Error']['Code'] == "404":
+                #         response = session.get(final_pdf_url, stream=True)
+                #         if response.status_code == 200:
+                #             s3_client.upload_fileobj(
+                #                 response.raw,
+                #                 BUCKET_NAME,
+                #                 s3_file_path,
+                #                 ExtraArgs={
+                #                     'ContentType': 'application/pdf',
+                #                     'ContentDisposition': 'inline'
+                #                 }
+                #             )
+                #             s3_url = f"https://{BUCKET_NAME}.s3.{REGION_NAME}.amazonaws.com/{s3_file_path}"
+                #         else:
+                #             s3_url = None
+                #     else:
+                #         s3_url = None
 
                 orders.append({
                     "order_number": order_number,
                     "order_date": order_date,
-                    "order_link": s3_url
+                    # "order_link": s3_url
                 })
 
         final_response = {
@@ -1241,15 +1324,15 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
         print(final_response)
 
         
-        result = collection.update_one(ac_query, {"$set": final_response}, upsert=True)
-        if result.upserted_id:
-            final_response["_id"] = str(result.upserted_id)
-        else:
-            if existing_id:
-                final_response["_id"] = existing_id
-            else:
-                doc = collection.find_one(ac_query)
-                final_response["_id"] = str(doc["_id"])
+        # result = collection.update_one(ac_query, {"$set": final_response}, upsert=True)
+        # if result.upserted_id:
+        #     final_response["_id"] = str(result.upserted_id)
+        # else:
+        #     if existing_id:
+        #         final_response["_id"] = existing_id
+        #     else:
+        #         doc = collection.find_one(ac_query)
+        #         final_response["_id"] = str(doc["_id"])
 
         return JSONResponse(content={"data": final_response}, status_code=200)
 
