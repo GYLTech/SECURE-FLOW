@@ -574,7 +574,7 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
             "courtType": "distcourts",
             "cino": query.get("cino"),
             "rgyear": query.get("rgyear"),
-            "est_code": query.get("est_code"),
+            "court_code": query.get("court_code"),
             "case_type": query.get("case_type"),
             "state_code": query.get("state_code"),
             "dist_code": query.get("dist_code"),
@@ -592,11 +592,11 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
         case_info = {
             "case_no": single_case.case_no,
             "cino": single_case.cino,
-            "court_code": single_case.court_code,
+            "court_code": single_case.court_code or None,
             "state_code": single_case.state_code,
             "dist_code": single_case.dist_code,
             "court_complex_code": single_case.court_complex_code,
-            "est_code": single_case.est_code or None,
+            "est_code": single_case.court_code or None,
             "rgyear": single_case.rgyear,
             "courtType": "distcourts"
         }
