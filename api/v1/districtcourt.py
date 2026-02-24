@@ -5,6 +5,7 @@ import requests
 from bs4 import BeautifulSoup
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
 import re
 from pydantic import BaseModel
 from typing import List, Optional
@@ -48,6 +49,7 @@ class CaseRequestBulkIngest(BaseModel):
     est_code: Optional[str] = None
     rgyear: str
     courtType: Optional[str] = None
+    refresh: str
 
 
 def build_case_base_path(metadata: dict):
@@ -265,19 +267,22 @@ def fetch_and_store_orders(
         order_number = cols[0].text.strip()
         order_date = cols[1].text.strip()
 
-        valid_link = next(
-            (
-                a for a in cols[2].find_all("a")
-                if re.search(r"displayPdf\((.*?)\)", a.get("onclick", ""))
-            ),
-            None
-        )
-
-        if not valid_link:
+        order_link = cols[2].find("a")
+        if not order_link:
             continue
 
-        match = re.search(r"displayPdf\((.*?)\)",
-                          valid_link.get("onclick", ""))
+        inner_a_tag = None
+        for a in order_link.find_all("a"):
+            onclick = a.get("onclick", "")
+            if "displayPdf" in onclick:
+                inner_a_tag = a
+                break
+
+        order_link = inner_a_tag or order_link
+
+        onclick_attr = order_link.get("onclick", "")
+        match = re.search(r"displayPdf\((.*?)\)", onclick_attr)
+
         if not match:
             continue
 
@@ -559,12 +564,12 @@ def fetch_submit_info(case_data: CaseRequestBulk):
     finally:
         session.close()
 
-
 @app.post("/dc/bulk_i/partyname")
 def fetch_submit_info(single_case: CaseRequestBulkIngest):
+    session = requests.Session()
     try:
-        session = requests.Session()
         query = single_case.dict()
+
         ac_query = {
             "courtType": "distcourts",
             "cino": query.get("cino"),
@@ -575,10 +580,14 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
             "dist_code": query.get("dist_code"),
             "court_complex_code": query.get("court_complex_code")
         }
+
         existing_case = collection.find_one(ac_query)
-        if existing_case:
+
+        if existing_case and single_case.refresh == "0":
             existing_case["_id"] = str(existing_case["_id"])
-            return JSONResponse(content=existing_case)
+            return JSONResponse(content=jsonable_encoder(existing_case))
+
+        existing_case_id = existing_case["_id"] if existing_case else None
 
         case_info = {
             "case_no": single_case.case_no,
@@ -602,57 +611,77 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
             "rgyear": str(case_info.get("rgyear", "")),
             "search_flag": "CScaseNumber",
             "search_by": "CScaseNumber",
-            "ajax_req": "true",
+            "ajax_req": "true"
         }
+
         if case_info.get("est_code") is not None:
             second_payload["est_code"] = str(case_info["est_code"])
+
         second_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=home/viewHistory"
         second_response = safe_post(session, second_url, second_payload)
 
         if second_response.status_code != 200:
-            print("❌ Failed request for", case_info["cino"])
             return JSONResponse(content={"error": "Failed request"}, status_code=500)
 
-        case_details = second_response.json()
-        soup = BeautifulSoup(case_details.get("data_list", ""), "html.parser")
-        case_status = extract_table_data(
-            soup, "table case_status_table table-bordered")
-        case_details = extract_table_data(
-            soup, "table case_details_table table-bordered")
-        case_petitioner = {"petitioner_and_advocate": extract_list_data(
-            soup, "table table-bordered Petitioner_Advocate_table")}
-        case_respondent = {"respondent_and_advocate": extract_list_data(
-            soup, "table table-bordered Respondent_Advocate_table")}
-        case_fir_details = {"fir_details": extract_fir_details(
-            soup, "FIR_details_table")}
+        case_data = second_response.json()
+        soup = BeautifulSoup(case_data.get("data_list", ""), "html.parser")
+
+        case_status = extract_table_data(soup, "table case_status_table table-bordered")
+        case_details = extract_table_data(soup, "table case_details_table table-bordered")
+        case_petitioner = {"petitioner_and_advocate": extract_list_data(soup, "table table-bordered Petitioner_Advocate_table")}
+        case_respondent = {"respondent_and_advocate": extract_list_data(soup, "table table-bordered Respondent_Advocate_table")}
+        case_fir_details = {"fir_details": extract_fir_details(soup, "FIR_details_table")}
         acts_and_sections = extract_acts_and_sections(soup)
         case_history = {"case_history": extract_case_history(soup)}
         case_transfer = {"case_transfer": extract_case_transfer(soup)}
+
         metadata = {
-                      **case_info, **case_fir_details, **case_details, **case_status, **case_petitioner,
-                                      **case_respondent, **acts_and_sections, **case_history, **case_transfer  
-                    }
+            **case_info,
+            **case_fir_details,
+            **case_details,
+            **case_status,
+            **case_petitioner,
+            **case_respondent,
+            **acts_and_sections,
+            **case_history,
+            **case_transfer
+        }
+
         case_json_s3_path = upload_case_json_to_s3(
-        s3_client,"dl-shared-gyl-vidilekh",metadata
+            s3_client,
+            "dl-shared-gyl-vidilekh",
+            metadata
         )
-        
+
         orders = fetch_and_store_orders(
             soup,
             session,
             metadata,
-            case_details,
+            case_data,
             s3_client,
-            'dl-shared-gyl-vidilekh',
+            "dl-shared-gyl-vidilekh",
             REGION_NAME
         )
 
-        final_response = {**case_info, **case_fir_details, **case_details, **case_status, **case_petitioner,
-                                      **case_respondent, **acts_and_sections, **case_history, **case_transfer,"s3_prefix" : case_json_s3_path, "orders": orders}
-        
-        insert_result = collection.insert_one(final_response)
-        final_response["_id"] = str(insert_result.inserted_id)
+        final_response = {
+            **metadata,
+            "s3_prefix": case_json_s3_path,
+            "orders": orders
+        }
 
-        return JSONResponse(content={"data": final_response}, status_code=200)
+        if existing_case_id:
+            collection.update_one(
+                {"_id": existing_case_id},
+                {"$set": final_response}
+            )
+            final_response["_id"] = str(existing_case_id)
+        else:
+            insert_result = collection.insert_one(
+                {**final_response}
+            )
+            final_response["_id"] = str(insert_result.inserted_id)
+
+        return JSONResponse(content=final_response, status_code=200)
 
     finally:
         session.close()
