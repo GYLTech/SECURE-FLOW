@@ -1,9 +1,11 @@
+import json
 import random
 import time
 import requests
 from bs4 import BeautifulSoup
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
 import re
 from pydantic import BaseModel
 from typing import List, Optional
@@ -15,7 +17,6 @@ from http.client import RemoteDisconnected
 load_dotenv()
 BUCKET_NAME = os.getenv("BUCKET_NAME")
 REGION_NAME = os.getenv("REGION_NAME")
-
 app = APIRouter()
 
 class CaseRequest(BaseModel):
@@ -26,8 +27,7 @@ class CaseRequest(BaseModel):
     dist_code: str
     court_complex_code: str
     est_code: Optional[str] = None
-    refresh_flag: str
-
+    courtType: Optional[str] = None
 
 class CaseRequestBulk(BaseModel):
     petres_name: str
@@ -49,23 +49,56 @@ class CaseRequestBulkIngest(BaseModel):
     est_code: Optional[str] = None
     rgyear: str
     courtType: Optional[str] = None
+    refresh: str
 
-def sanitize_key(key):
-    key = re.sub(r'[.$]', '', key)
-    key = key.replace(':', '').replace(' ', '')
-    return key
 
+def build_case_base_path(metadata: dict):
+    return (
+        f"cases/"
+        f"{metadata['courtType']}/"
+        f"{metadata['state_code']}/"
+        f"{metadata['dist_code']}/"
+        f"{metadata['court_complex_code']}/"
+        f"{metadata['rgyear']}/"
+        f"{metadata['cino']}/"
+    )
+
+def build_orders_prefix(metadata: dict):
+    return build_case_base_path(metadata) + "orders/"
+
+def build_case_json_key(metadata: dict):
+    return build_case_base_path(metadata) + "metadata.json"
+
+def upload_case_json_to_s3(
+    s3_client,
+    bucket_name,
+    metadata
+):
+    key = build_case_json_key(metadata)
+
+    payload = {
+        **metadata
+    }
+
+    s3_client.put_object(
+        Bucket=bucket_name,
+        Key=key,
+        Body=json.dumps(payload, ensure_ascii=False),
+        ContentType="application/json"
+    )
+
+    return f"s3://{bucket_name}/{key}"
 
 def safe_post(session, url, data, max_retries=3):
     for attempt in range(max_retries):
         try:
-            time.sleep(random.uniform(1.2, 2.0))  
+            time.sleep(random.uniform(1.2, 2.0))
 
             response = session.post(
                 url,
                 data=data,
-                timeout=(10, 120), 
-                headers={"Connection": "close"} 
+                timeout=(10, 120),
+                headers={"Connection": "close"}
             )
             return response
 
@@ -80,11 +113,244 @@ def safe_post(session, url, data, max_retries=3):
 
     raise Exception("❌ eCourts viewHistory failed after retries")
 
+
+def sanitize_keys(data):
+    clean_data = {}
+    for key, value in data.items():
+        clean_key = key.replace('.', '').replace('$', '')
+        if isinstance(value, dict):
+            clean_data[clean_key] = sanitize_keys(value)
+        else:
+            clean_data[clean_key] = value
+    return clean_data
+
+
+def extract_table_data(soup, table_class):
+    table = soup.find("table", {"class": table_class})
+    data = {}
+    if table:
+        rows = table.find_all("tr")
+        for row in rows:
+            cells = row.find_all("td")
+            if len(cells) >= 2:
+                key = cells[0].get_text(strip=True).replace(
+                    ':', '').replace(' ', '')
+                value = cells[1].get_text(strip=True)
+                data[key] = value
+    return sanitize_keys(data)
+
+
+def extract_list_data(soup, table_class):
+    table = soup.find("table", {"class": table_class})
+    values = []
+    if table:
+        cell = table.find("td")
+        if cell:
+            values = [line.strip()
+                      for line in cell.stripped_strings if line.strip()]
+    return values
+
+
+def extract_fir_details(soup, table_class):
+    table = soup.find(
+        "table", class_=lambda x: x and table_class in x)
+    details = {}
+    if table:
+        rows = table.find_all("tr")
+        for row in rows:
+            cols = row.find_all("td")
+            if len(cols) == 2:
+                key = cols[0].get_text(
+                    strip=True).replace(" ", "")
+                value = cols[1].get_text(strip=True)
+                details[key] = value
+    return details
+
+
+def extract_case_history(soup):
+    table = soup.find("table", {"class": "history_table"})
+    rows = table.find_all("tr") if table else []
+    history = []
+
+    for row in rows:
+        cols = row.find_all("td")
+        if len(cols) >= 4:
+            history.append({
+                "judge": cols[0].text.strip(),
+                "businessOnDate": cols[1].find("a").text.strip() if cols[1].find("a") else "",
+                "hearingDate": cols[2].text.strip(),
+                "purpose": cols[3].text.strip(),
+                "inputType": "automatic",
+                "lawyerRemark": "null"
+            })
+
+    return history or []
+
+
+def extract_case_transfer(soup):
+    table = soup.find(
+        "table", {"class": "transfer_table table"})
+    transfers = []
+
+    if table:
+        rows = table.find_all("tr")[1:]
+        for row in rows:
+            cols = row.find_all("td")
+            if len(cols) >= 4:
+                transfers.append({
+                    "registrationNumber": cols[0].text.strip(),
+                    "transferDate": cols[1].text.strip(),
+                    "fromCourt": cols[2].text.strip(),
+                    "toCourt": cols[3].text.strip(),
+                    "inputType": "automatic",
+                    "lawyerRemark": None
+                })
+
+    return transfers
+
+
+def extract_acts_and_sections(
+    soup,
+    table_class="table acts_table table-bordered"
+):
+    acts_and_sections = {
+        "actsandSection": {
+            "acts": "null",
+            "section": "null"
+        }
+    }
+
+    act_table = soup.find("table", {"class": table_class})
+    if not act_table:
+        return acts_and_sections
+
+    rows = act_table.find_all("tr")[1:]
+
+    for row in rows:
+        cells = row.find_all("td")
+        if len(cells) == 2:
+            acts_and_sections["actsandSection"] = {
+                "acts": cells[0].get_text(strip=True),
+                "section": cells[1].get_text(strip=True)
+            }
+
+    return acts_and_sections
+
+
+def fetch_and_store_orders(
+    soup,
+    session,
+    metadata,
+    case_details,
+    s3_client,
+    bucket_name,
+    region_name,
+    table_class="order_table",
+    pdf_endpoint="https://services.ecourts.gov.in/ecourtindia_v6/?p=home/display_pdf",
+    pdf_base_url="https://services.ecourts.gov.in/ecourtindia_v6/"
+):
+    orders_prefix = build_case_base_path(metadata) + "orders/"
+    orders = []
+    order_table = soup.find("table", {"class": table_class})
+
+    if not order_table:
+        return orders
+
+    rows = order_table.find_all("tr")[1:]
+    app_token = case_details.get("app_token", "")
+
+    for row in rows:
+        cols = row.find_all("td")
+        if len(cols) < 3:
+            continue
+
+        order_number = cols[0].text.strip()
+        order_date = cols[1].text.strip()
+
+        order_link = cols[2].find("a")
+        if not order_link:
+            continue
+
+        inner_a_tag = None
+        for a in order_link.find_all("a"):
+            onclick = a.get("onclick", "")
+            if "displayPdf" in onclick:
+                inner_a_tag = a
+                break
+
+        order_link = inner_a_tag or order_link
+
+        onclick_attr = order_link.get("onclick", "")
+        match = re.search(r"displayPdf\((.*?)\)", onclick_attr)
+
+        if not match:
+            continue
+
+        values = [v.strip().strip("'") for v in match.group(1).split(",")]
+        if len(values) < 4:
+            continue
+
+        order_payload = {
+            "normal_v": values[0],
+            "case_val": values[1],
+            "court_code": values[2],
+            "filename": values[3],
+            "appFlag": values[4] if len(values) > 4 else "",
+            "ajax_req": "true",
+            "app_token": app_token
+        }
+
+        order_response = safe_post(session, pdf_endpoint, order_payload)
+
+        try:
+            response_json = order_response.json()
+            app_token = response_json.get("app_token", app_token)
+            pdf_path = response_json.get("order", "").replace("\\", "")
+        except Exception:
+            continue
+
+        if not pdf_path:
+            continue
+
+        final_pdf_url = f"{pdf_base_url}{pdf_path}"
+        s3_key = f"{orders_prefix}order-{order_number.zfill(3)}.pdf"
+
+        try:
+            s3_client.head_object(Bucket=bucket_name, Key=s3_key)
+            s3_url = f"https://{bucket_name}.s3.{region_name}.amazonaws.com/{s3_key}"
+        except s3_client.exceptions.ClientError as e:
+            if e.response["Error"]["Code"] == "404":
+                pdf_response = session.get(final_pdf_url, stream=True)
+                if pdf_response.status_code == 200:
+                    s3_client.upload_fileobj(
+                        pdf_response.raw,
+                        bucket_name,
+                        s3_key,
+                        ExtraArgs={
+                            "ContentType": "application/pdf",
+                            "ContentDisposition": "inline"
+                        }
+                    )
+                    s3_url = f"https://{bucket_name}.s3.{region_name}.amazonaws.com/{s3_key}"
+                else:
+                    s3_url = None
+            else:
+                s3_url = None
+
+        orders.append({
+            "order_number": order_number,
+            "order_date": order_date,
+            "order_link": s3_url
+        })
+
+    return orders
+
+
 @app.post("/getcaseInfo")
 def fetch_submit_info(case_data: CaseRequest):
-    session = requests.Session()
     query = case_data.dict()
     ac_query = {
+        "courtType": query.get("courtType"),
         "case_reg_no": query.get("case_reg_no"),
         "rgyear": query.get("rgyear"),
         "est_code": query.get("est_code"),
@@ -93,12 +359,12 @@ def fetch_submit_info(case_data: CaseRequest):
         "dist_code": query.get("dist_code"),
         "court_complex_code": query.get("court_complex_code")
     }
-    if case_data.refresh_flag != "1":
-        existing_case = collection.find_one(ac_query)
-        if existing_case:
-            existing_case["_id"] = str(existing_case["_id"])
-            return JSONResponse(content=existing_case)
-
+    existing_case = collection.find_one(ac_query)
+    if existing_case:
+        existing_case["_id"] = str(existing_case["_id"])
+        return JSONResponse(content=existing_case)
+    
+    session = requests.Session()
     case_info = {}
 
     try:
@@ -115,7 +381,7 @@ def fetch_submit_info(case_data: CaseRequest):
         }
 
         search_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=casestatus/submitCaseNo"
-        response = safe_post(session,search_url, payload)
+        response = safe_post(session, search_url, payload)
 
         html_content = response.json().get("case_data", "")
 
@@ -143,7 +409,8 @@ def fetch_submit_info(case_data: CaseRequest):
                     "est_code": case_data.est_code,
                     "case_type": case_data.case_type,
                     "rgyear": case_data.rgyear,
-                    "case_reg_no": case_data.case_reg_no
+                    "case_reg_no": case_data.case_reg_no,
+                    "courtType" : case_data.courtType,
                 }
 
                 second_payload = {
@@ -162,278 +429,55 @@ def fetch_submit_info(case_data: CaseRequest):
 
                 second_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=home/viewHistory"
 
-                second_response = safe_post(session,second_url, second_payload)
-                print("second response",second_response.text)
+                second_response = safe_post(
+                    session, second_url, second_payload)
 
                 if second_response.status_code == 200:
                     case_details = second_response.json()
                     soup = BeautifulSoup(case_details.get(
                         "data_list", ""), "html.parser")
 
-                    def extract_table_data(table_class):
-                        table = soup.find("table", {"class": table_class})
-                        data = {}
-                        if table:
-                            rows = table.find_all("tr")
-                            for row in rows:
-                                cells = row.find_all("td")
-                                if len(cells) >= 2:
-                                    raw_key = cells[0].get_text(strip=True)
-                                    key = sanitize_key(raw_key)
-                                    value = cells[1].get_text(strip=True)
-                                    data[key] = value
-                        return data
-
                     case_status = extract_table_data(
-                        "table case_status_table table-bordered")
+                        soup, "table case_status_table table-bordered")
                     case_details = extract_table_data(
-                        "table case_details_table table-bordered")
-
-                    def extract_list_data(table_class):
-                        table = soup.find("table", {"class": table_class})
-
-                        values = []
-                        if table:
-                            cell = table.find("td")
-                            if cell:
-                                values = [
-                                    line.strip() for line in cell.stripped_strings if line.strip()]
-                        return values
-
+                        soup, "table case_details_table table-bordered")
                     case_petitioner = {"petitioner_and_advocate": extract_list_data(
-                        "table table-bordered Petitioner_Advocate_table")}
+                        soup, "table table-bordered Petitioner_Advocate_table")}
                     case_respondent = {"respondent_and_advocate": extract_list_data(
-                        "table table-bordered Respondent_Advocate_table")}
+                        soup, "table table-bordered Respondent_Advocate_table")}
+                    case_fir_details = {"fir_details": extract_fir_details(
+                        soup, "FIR_details_table")}
+                    acts_and_sections = extract_acts_and_sections(soup)
+                    case_history = {"case_history": extract_case_history(soup)}
+                    case_transfer = {
+                        "case_transfer": extract_case_transfer(soup)}
 
-                    def extract_fir_details(table_class):
-                        table = soup.find(
-                            "table", class_=lambda x: x and table_class in x)
-                        details = {}
-                        if table:
-                            rows = table.find_all("tr")
-                            for row in rows:
-                                cols = row.find_all("td")
-                                if len(cols) == 2:
-                                    key = cols[0].get_text(
-                                        strip=True).replace(" ", "")
-                                    value = cols[1].get_text(strip=True)
-                                    details[key] = value
-                        return details
+                    metadata = {
+                      **case_info, **case_fir_details, **case_details, **case_status, **case_petitioner,
+                                      **case_respondent, **acts_and_sections, **case_history, **case_transfer  
+                    }
 
-                    case_fir_details = {
-                        "fir_details": extract_fir_details("FIR_details_table")}
+                    case_json_s3_path = upload_case_json_to_s3(
+                    s3_client,"dl-shared-gyl-vidilekh",metadata
+                    )
 
-                    act_table = soup.find(
-                        "table", {"class": "table acts_table table-bordered"})
-                    acts_and_sections = {"actsandSection": {
-                        "acts": "null", "section": "null"}}
+                    orders = fetch_and_store_orders(
+                        soup,
+                        session,
+                        metadata,
+                        case_details,
+                        s3_client,
+                        "dl-shared-gyl-vidilekh",
+                        REGION_NAME
+                    )
 
-                    if act_table:
-                        rows = act_table.find_all("tr")[1:]
-                        for row in rows:
-                            cells = row.find_all("td")
-                            if len(cells) == 2:
-                                acts_and_sections["actsandSection"] = {
-                                    "acts": cells[0].get_text(strip=True),
-                                    "section": cells[1].get_text(strip=True)
-                                }
-
-                    def extract_case_history():
-                        table = soup.find("table", {"class": "history_table"})
-                        rows = table.find_all("tr") if table else []
-                        history = []
-
-                        for row in rows:
-                            cols = row.find_all("td")
-                            if len(cols) >= 4:
-                                history.append({
-                                    "judge": cols[0].text.strip(),
-                                    "businessOnDate": cols[1].find("a").text.strip() if cols[1].find("a") else "",
-                                    "hearingDate": cols[2].text.strip(),
-                                    "purpose": cols[3].text.strip(),
-                                    "inputType": "automatic",
-                                    "lawyerRemark": "null"
-                                })
-
-                        return history or []
-
-                    case_history = {"case_history": extract_case_history()}
-
-                    def extract_case_transfer():
-                        table = soup.find(
-                            "table", {"class": "transfer_table table"})
-                        transfers = []
-
-                        if table:
-                            rows = table.find_all("tr")[1:]
-                            for row in rows:
-                                cols = row.find_all("td")
-                                if len(cols) >= 4:
-                                    transfers.append({
-                                        "registrationNumber": cols[0].text.strip(),
-                                        "transferDate": cols[1].text.strip(),
-                                        "fromCourt": cols[2].text.strip(),
-                                        "toCourt": cols[3].text.strip(),
-                                        "inputType": "automatic",
-                                        "lawyerRemark": None
-                                    })
-
-                        return transfers
-
-                    case_transfer = {"case_transfer": extract_case_transfer()}
-
-                    orders = []
-                    order_table = soup.find("table", {"class": "order_table"})
-
-                    if not order_table:
-                        print("No order_table found.")
-                    else:
-                        rows = order_table.find_all("tr")[1:]
-
-                        if not rows:
-                            print("No rows found in order_table.")
-
-                        app_token = second_response.json().get("app_token", "")
-
-                        for index, row in enumerate(rows):
-                            cols = row.find_all("td")
-                            if len(cols) < 3:
-                                print(
-                                    f"⚠️ Skipping row with insufficient columns: {row}")
-                                continue
-
-                            order_number = cols[0].text.strip()
-                            order_date = cols[1].text.strip()
-                            order_link = cols[2].find("a")
-
-                            print("order link", order_link)
-
-                            if not order_link:
-                                print(
-                                    f"⚠️ No anchor tag found for order {order_number}. Skipping PDF fetch.")
-                                orders.append({
-                                    "order_number": order_number,
-                                    "order_date": order_date,
-                                    "order_link": None,
-                                    "note": "No order link available"
-                                })
-                                continue
-                            inner_a_tag = None
-                            for a in order_link.find_all("a"):
-                                if a.get("onclick") and "displayPdf" in a.get("onclick"):
-                                    inner_a_tag = a
-                                    break
-                            order_link = inner_a_tag or order_link
-                            onclick_attr = order_link.get("onclick", "")
-                            match = re.search(
-                                r"displayPdf\((.*?)\)", onclick_attr)
-
-                            if not match:
-                                print(
-                                    f"⚠️ No 'onclick' match found for order {order_number}. Skipping PDF fetch.")
-                                orders.append({
-                                    "order_number": order_number,
-                                    "order_date": order_date,
-                                    "order_link": None,
-                                    "note": "No valid onclick for PDF"
-                                })
-                                continue
-
-                            params = match.group(1)
-                            values = [v.strip().strip("'")
-                                      for v in params.split(",")]
-
-                            if len(values) < 4:
-                                print(
-                                    f"⚠️ Invalid onclick parameters for order {order_number}. Skipping.")
-                                continue
-
-                            normal_v = values[0]
-                            case_val = values[1]
-                            court_code = values[2]
-                            filename = values[3]
-                            app_flag = values[4] if len(values) > 4 else ""
-
-                            order_payload = {
-                                "normal_v": normal_v,
-                                "case_val": case_val,
-                                "court_code": court_code,
-                                "filename": filename,
-                                "appFlag": app_flag,
-                                "ajax_req": "true",
-                                "app_token": app_token
-                            }
-
-                            full_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=home/display_pdf"
-                            order_response = safe_post(session,full_url, order_payload)
-                            print("order response,", order_response.text)
-
-                            try:
-                                token_update = order_response.json()
-                                new_app_token = token_update.get("app_token")
-                                if new_app_token:
-                                    app_token = new_app_token
-                            except Exception:
-                                pass
-
-                            order_response_data = order_response.json()
-                            pdf_file_path = order_response_data.get(
-                                "order", "").replace("\\", "")
-
-                            if not pdf_file_path:
-                                print(
-                                    f"❌ PDF path not found in object for order {order_number}.")
-                                continue
-
-                            final_pdf_url = f"https://services.ecourts.gov.in/ecourtindia_v6/{pdf_file_path}"
-
-                            s3_folder_path = f"case_data/orders/{case_info['cino']}/"
-                            s3_file_path = f"{s3_folder_path}{case_info['cino']}-{order_number}.pdf"
-                            try:
-                                s3_client.head_object(
-                                    Bucket=BUCKET_NAME, Key=s3_file_path)
-                                s3_url = f"https://{BUCKET_NAME}.s3.{REGION_NAME}.amazonaws.com/{s3_file_path}"
-                            except s3_client.exceptions.ClientError as e:
-                                if e.response['Error']['Code'] == "404":
-                                    response = session.get(
-                                        final_pdf_url, stream=True)
-                                    if response.status_code == 200:
-                                        s3_client.upload_fileobj(
-                                            response.raw,
-                                            BUCKET_NAME,
-                                            s3_file_path,
-                                            ExtraArgs={
-                                                'ContentType': 'application/pdf',
-                                                'ContentDisposition': 'inline'
-                                            }
-                                        )
-                                        s3_url = f"https://{BUCKET_NAME}.s3.{REGION_NAME}.amazonaws.com/{s3_file_path}"
-                                    else:
-                                        print(
-                                            f"❌ Failed to fetch PDF from {final_pdf_url}")
-                                        s3_url = None
-                                else:
-                                    print(f"❌ S3 Error: {e}")
-                                    s3_url = None
-
-                            orders.append({
-                                "order_number": order_number,
-                                "order_date": order_date,
-                                "order_link": s3_url
-                            })
 
                     final_response = {**case_info, **case_fir_details, **case_details, **case_status, **case_petitioner,
-                                      **case_respondent, **acts_and_sections, **case_history, **case_transfer, "orders": orders}
-                    
+                                      **case_respondent, **acts_and_sections, **case_history, **case_transfer,"s3_prefix" : case_json_s3_path, "orders": orders}
 
-                    # print("final response",final_response)
-                    result = collection.update_one(
-                        ac_query, {"$set": final_response}, upsert=True)
-                    if result.upserted_id:
-                        final_response["_id"] = str(result.upserted_id)
-                    else:
-                        doc = collection.find_one(ac_query)
-                        final_response["_id"] = str(doc["_id"])
+                    
+                    insert_result = collection.insert_one(final_response)
+                    final_response["_id"] = str(insert_result.inserted_id)
 
                     return JSONResponse(content=final_response)
                 else:
@@ -443,6 +487,7 @@ def fetch_submit_info(case_data: CaseRequest):
 
     finally:
         session.close()
+
 
 @app.post("/dc/bulk_q/partyname")
 def fetch_submit_info(case_data: CaseRequestBulk):
@@ -462,7 +507,7 @@ def fetch_submit_info(case_data: CaseRequestBulk):
         }
 
         search_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=casestatus/submitPartyName"
-        response = safe_post(session,search_url,payload)
+        response = safe_post(session, search_url, payload)
 
         html_content = response.json().get("party_data", "")
 
@@ -521,33 +566,39 @@ def fetch_submit_info(case_data: CaseRequestBulk):
 
 @app.post("/dc/bulk_i/partyname")
 def fetch_submit_info(single_case: CaseRequestBulkIngest):
+    session = requests.Session()
     try:
-        session = requests.Session()
         query = single_case.dict()
+
         ac_query = {
+            "courtType": "distcourts",
             "cino": query.get("cino"),
             "rgyear": query.get("rgyear"),
-            "est_code": query.get("est_code"),
+            "court_code": query.get("court_code"),
             "case_type": query.get("case_type"),
             "state_code": query.get("state_code"),
             "dist_code": query.get("dist_code"),
             "court_complex_code": query.get("court_complex_code")
         }
+
         existing_case = collection.find_one(ac_query)
-        if existing_case:
+
+        if existing_case and single_case.refresh == "0":
             existing_case["_id"] = str(existing_case["_id"])
-            existing_id = str(existing_case["_id"]) if existing_case else None
+            return JSONResponse(content=jsonable_encoder(existing_case))
+
+        existing_case_id = existing_case["_id"] if existing_case else None
 
         case_info = {
             "case_no": single_case.case_no,
             "cino": single_case.cino,
-            "court_code": single_case.court_code,
+            "court_code": single_case.court_code or None,
             "state_code": single_case.state_code,
             "dist_code": single_case.dist_code,
             "court_complex_code": single_case.court_complex_code,
-            "est_code": single_case.est_code or None,
+            "est_code": single_case.court_code or None,
             "rgyear": single_case.rgyear,
-            "courtType": single_case.courtType
+            "courtType": "distcourts"
         }
 
         second_payload = {
@@ -560,248 +611,77 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
             "rgyear": str(case_info.get("rgyear", "")),
             "search_flag": "CScaseNumber",
             "search_by": "CScaseNumber",
-            "ajax_req": "true",
+            "ajax_req": "true"
         }
+
         if case_info.get("est_code") is not None:
             second_payload["est_code"] = str(case_info["est_code"])
+
         second_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=home/viewHistory"
-        second_response = safe_post(session,second_url, second_payload)
+        second_response = safe_post(session, second_url, second_payload)
 
         if second_response.status_code != 200:
-            print("❌ Failed request for", case_info["cino"])
             return JSONResponse(content={"error": "Failed request"}, status_code=500)
 
-        case_details = second_response.json()
-        soup = BeautifulSoup(case_details.get("data_list", ""), "html.parser")
+        case_data = second_response.json()
+        soup = BeautifulSoup(case_data.get("data_list", ""), "html.parser")
 
-        def sanitize_keys(data):
-            clean_data = {}
-            for key, value in data.items():
-                clean_key = key.replace('.', '').replace('$', '')
-                if isinstance(value, dict):
-                    clean_data[clean_key] = sanitize_keys(value)
-                else:
-                    clean_data[clean_key] = value
-            return clean_data
+        case_status = extract_table_data(soup, "table case_status_table table-bordered")
+        case_details = extract_table_data(soup, "table case_details_table table-bordered")
+        case_petitioner = {"petitioner_and_advocate": extract_list_data(soup, "table table-bordered Petitioner_Advocate_table")}
+        case_respondent = {"respondent_and_advocate": extract_list_data(soup, "table table-bordered Respondent_Advocate_table")}
+        case_fir_details = {"fir_details": extract_fir_details(soup, "FIR_details_table")}
+        acts_and_sections = extract_acts_and_sections(soup)
+        case_history = {"case_history": extract_case_history(soup)}
+        case_transfer = {"case_transfer": extract_case_transfer(soup)}
 
-        def extract_table_data(table_class):
-            table = soup.find("table", {"class": table_class})
-            data = {}
-            if table:
-                rows = table.find_all("tr")
-                for row in rows:
-                    cells = row.find_all("td")
-                    if len(cells) >= 2:
-                        key = cells[0].get_text(strip=True).replace(':', '').replace(' ', '')
-                        value = cells[1].get_text(strip=True)
-                        data[key] = value
-            return sanitize_keys(data)
-
-        def extract_list_data(table_class):
-            table = soup.find("table", {"class": table_class})
-            values = []
-            if table:
-                cell = table.find("td")
-                if cell:
-                    values = [line.strip() for line in cell.stripped_strings if line.strip()]
-            return values
-
-        def extract_fir_details(table_class):
-            table = soup.find("table", class_=lambda x: x and table_class in x)
-            details = {}
-            if table:
-                rows = table.find_all("tr")
-                for row in rows:
-                    cols = row.find_all("td")
-                    if len(cols) == 2:
-                        key = cols[0].get_text(strip=True).replace(" ", "")
-                        value = cols[1].get_text(strip=True)
-                        details[key] = value
-            return details
-
-        def extract_case_history():
-            table = soup.find("table", {"class": "history_table"})
-            rows = table.find_all("tr") if table else []
-            history = []
-            for row in rows:
-                cols = row.find_all("td")
-                if len(cols) >= 4:
-                    history.append({
-                        "judge": cols[0].text.strip(),
-                        "businessOnDate": cols[1].find("a").text.strip() if cols[1].find("a") else "",
-                        "hearingDate": cols[2].text.strip(),
-                        "purpose": cols[3].text.strip(),
-                        "inputType": "automatic",
-                        "lawyerRemark": "null"
-                    })
-            return history or []
-
-        def extract_case_transfer():
-            table = soup.find("table", {"class": "transfer_table table"})
-            transfers = []
-            if table:
-                rows = table.find_all("tr")[1:]
-                for row in rows:
-                    cols = row.find_all("td")
-                    if len(cols) >= 4:
-                        transfers.append({
-                            "registrationNumber": cols[0].text.strip(),
-                            "transferDate": cols[1].text.strip(),
-                            "fromCourt": cols[2].text.strip(),
-                            "toCourt": cols[3].text.strip(),
-                            "inputType": "automatic",
-                            "lawyerRemark": None
-                        })
-            return transfers
-
-        case_status = extract_table_data("table case_status_table table-bordered")
-        case_details_data = extract_table_data("table case_details_table table-bordered")
-        case_petitioner = {"petitioner_and_advocate": extract_list_data("table table-bordered Petitioner_Advocate_table")}
-        case_respondent = {"respondent_and_advocate": extract_list_data("table table-bordered Respondent_Advocate_table")}
-        case_fir_details = {"fir_details": extract_fir_details("FIR_details_table")}
-        acts_and_sections = {"actsandSection": {"acts": "null", "section": "null"}}
-
-        act_table = soup.find("table", {"class": "table acts_table table-bordered"})
-        if act_table:
-            rows = act_table.find_all("tr")[1:]
-            for row in rows:
-                cells = row.find_all("td")
-                if len(cells) == 2:
-                    acts_and_sections["actsandSection"] = {
-                        "acts": cells[0].get_text(strip=True),
-                        "section": cells[1].get_text(strip=True)
-                    }
-
-        case_history = {"case_history": extract_case_history()}
-        case_transfer = {"case_transfer": extract_case_transfer()}
-
-        orders = []
-        order_table = soup.find("table", {"class": "order_table"})
-
-        if order_table:
-            rows = order_table.find_all("tr")[1:]
-            app_token = case_details.get("app_token", "")
-
-            for row in rows:
-                cols = row.find_all("td")
-                if len(cols) < 3:
-                    continue
-
-                order_number = cols[0].text.strip()
-                order_date = cols[1].text.strip()
-
-                all_links = cols[2].find_all("a")
-                valid_link = None
-
-                for a in all_links:
-                    onclick = a.get("onclick", "")
-                    if re.search(r"displayPdf\((.*?)\)", onclick):
-                        valid_link = a
-                        break
-
-                if not valid_link:
-                    continue
-
-                onclick_attr = valid_link.get("onclick", "")
-                match = re.search(r"displayPdf\((.*?)\)", onclick_attr)
-                if not match:
-                    continue
-
-                values = [v.strip().strip("'") for v in match.group(1).split(",")]
-                if len(values) < 4:
-                    continue
-
-                normal_v = values[0]
-                case_val = values[1]
-                court_code = values[2]
-                filename = values[3]
-                app_flag = values[4] if len(values) > 4 else ""
-
-                order_payload = {
-                    "normal_v": normal_v,
-                    "case_val": case_val,
-                    "court_code": court_code,
-                    "filename": filename,
-                    "appFlag": app_flag,
-                    "ajax_req": "true",
-                    "app_token": app_token
-                }
-
-                full_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=home/display_pdf"
-                order_response = safe_post(session,full_url, order_payload)
-
-                try:
-                    token_update = order_response.json()
-                    new_app_token = token_update.get("app_token")
-                    if new_app_token:
-                        app_token = new_app_token
-                except:
-                    pass
-
-                order_response_data = order_response.json()
-                pdf_file_path = order_response_data.get("order", "").replace("\\", "")
-                if not pdf_file_path:
-                    continue
-
-                final_pdf_url = f"https://services.ecourts.gov.in/ecourtindia_v6/{pdf_file_path}"
-
-                s3_folder_path = f"case_data/orders/{case_info['cino']}/"
-                s3_file_path = f"{s3_folder_path}{case_info['cino']}-{order_number}.pdf"
-                
-
-                try:
-                    s3_client.head_object(Bucket=BUCKET_NAME, Key=s3_file_path)
-                    s3_url = f"https://{BUCKET_NAME}.s3.{REGION_NAME}.amazonaws.com/{s3_file_path}"
-                except s3_client.exceptions.ClientError as e:
-                    if e.response['Error']['Code'] == "404":
-                        response = session.get(final_pdf_url, stream=True)
-                        if response.status_code == 200:
-                            s3_client.upload_fileobj(
-                                response.raw,
-                                BUCKET_NAME,
-                                s3_file_path,
-                                ExtraArgs={
-                                    'ContentType': 'application/pdf',
-                                    'ContentDisposition': 'inline'
-                                }
-                            )
-                            s3_url = f"https://{BUCKET_NAME}.s3.{REGION_NAME}.amazonaws.com/{s3_file_path}"
-                        else:
-                            s3_url = None
-                    else:
-                        s3_url = None
-
-                orders.append({
-                    "order_number": order_number,
-                    "order_date": order_date,
-                    "order_link": s3_url
-                })
-
-        final_response = {
+        metadata = {
             **case_info,
             **case_fir_details,
-            **case_details_data,
+            **case_details,
             **case_status,
             **case_petitioner,
             **case_respondent,
             **acts_and_sections,
             **case_history,
-            **case_transfer,
+            **case_transfer
+        }
+
+        case_json_s3_path = upload_case_json_to_s3(
+            s3_client,
+            "dl-shared-gyl-vidilekh",
+            metadata
+        )
+
+        orders = fetch_and_store_orders(
+            soup,
+            session,
+            metadata,
+            case_data,
+            s3_client,
+            "dl-shared-gyl-vidilekh",
+            REGION_NAME
+        )
+
+        final_response = {
+            **metadata,
+            "s3_prefix": case_json_s3_path,
             "orders": orders
         }
 
-        result = collection.update_one(ac_query, {"$set": final_response}, upsert=True)
-        if result.upserted_id:
-            final_response["_id"] = str(result.upserted_id)
+        if existing_case_id:
+            collection.update_one(
+                {"_id": existing_case_id},
+                {"$set": final_response}
+            )
+            final_response["_id"] = str(existing_case_id)
         else:
-            if existing_id:
-                final_response["_id"] = existing_id
-            else:
-                doc = collection.find_one(ac_query)
-                final_response["_id"] = str(doc["_id"])
+            insert_result = collection.insert_one(
+                {**final_response}
+            )
+            final_response["_id"] = str(insert_result.inserted_id)
 
-        return JSONResponse(content={"data": final_response}, status_code=200)
+        return JSONResponse(content=final_response, status_code=200)
 
     finally:
         session.close()
-

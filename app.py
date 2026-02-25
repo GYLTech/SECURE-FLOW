@@ -23,9 +23,6 @@ app.include_router(nclt.app, prefix="/api/v1", tags=["Nclt"])
 app.include_router(sci.app, prefix="/api/v1", tags=["Sci"])
 
 
-
-
-
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app,host="127.0.0.1",port=8000)
