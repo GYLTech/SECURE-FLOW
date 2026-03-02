@@ -1,20 +1,20 @@
 from fastapi import FastAPI
-import sentry_sdk
-from api.v1 import districtcourt, hc2, cc, nclt,sci, drt, aft
+# import sentry_sdk
+from api.v1 import districtcourt, hc2, cc, nclt,sci, drt, aft, nclatt
 app = FastAPI(title="Secure Flow By GYL")
 
-sentry_sdk.init(
-    dsn="https://d5ba717dbd1a1f3eec57fb1ec6798284@o4508364047712256.ingest.us.sentry.io/4510724946853888",
-    send_default_pii=True,
-)
+# sentry_sdk.init(
+#     dsn="https://d5ba717dbd1a1f3eec57fb1ec6798284@o4508364047712256.ingest.us.sentry.io/4510724946853888",
+#     send_default_pii=True,
+# )
 
 @app.get("/")
 async def root():
     return {"message": "Hello World"}
 
-@app.get("/sentry-debug")
-async def trigger_error():
-    division_by_zero = 1 / 0
+# @app.get("/sentry-debug")
+# async def trigger_error():
+#     division_by_zero = 1 / 0
 
 app.include_router(districtcourt.app, prefix="/api/v1", tags=["Districtcourt"])
 app.include_router(hc2.app, prefix="/api/v1", tags=["Hccourt2"])
@@ -23,7 +23,7 @@ app.include_router(nclt.app, prefix="/api/v1", tags=["Nclt"])
 app.include_router(sci.app, prefix="/api/v1", tags=["Sci"])
 app.include_router(drt.app, prefix="/api/v1", tags=["drt"])
 app.include_router(aft.router, prefix="/api/v1", tags=["AFT"])
-
+app.include_router(nclatt.app, prefix="/api/v1", tags=["NCLATT"])
 
 if __name__ == "__main__":
     import uvicorn
