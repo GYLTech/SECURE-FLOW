@@ -15,7 +15,6 @@ from core.s3_client import s3_client
 import os
 from http.client import RemoteDisconnected
 load_dotenv()
-BUCKET_NAME = os.getenv("BUCKET_NAME")
 REGION_NAME = os.getenv("REGION_NAME")
 app = APIRouter()
 
@@ -49,7 +48,6 @@ class CaseRequestBulkIngest(BaseModel):
     est_code: Optional[str] = None
     rgyear: str
     courtType: Optional[str] = None
-    refresh: str
 
 
 def build_case_base_path(metadata: dict):
@@ -706,7 +704,7 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
             "s3_prefix": case_json_s3_path,
             "orders": orders
         }
-        print("final_response",final_response)
+        # print("final_response",final_response)
 
         if existing_case_id:
             collection.update_one(
