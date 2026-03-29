@@ -125,31 +125,55 @@ def sanitize_keys(data):
     return clean_data
 
 
+
 def extract_table_data(soup, table_class):
-    table = soup.find("table", {"class": table_class})
+    tables = soup.find_all("table", {"class": table_class})
     data = {}
-    if table:
+
+    for table in tables:
         rows = table.find_all("tr")
+
         for row in rows:
-            cells = row.find_all("td")
-            if len(cells) >= 2:
-                key = cells[0].get_text(strip=True).replace(
-                    ':', '').replace(' ', '')
-                value = cells[1].get_text(strip=True)
-                data[key] = value
+            headers = row.find_all("th")
+            values = row.find_all("td")
+
+            for h, v in zip(headers, values):
+                key = h.get_text(strip=True).replace(":", "")
+                key = "".join(key.split())  
+
+                value = v.get_text(strip=True)
+
+                if "CNR" in key:
+                    span = v.find("span")
+                    if span:
+                        value = span.get_text(strip=True)
+
+                if key:
+                    data[key] = value
+
     return sanitize_keys(data)
 
-
+# def extract_list_data(soup, table_class):
+#     table = soup.find("table", {"class": table_class})
+#     values = []
+#     if table:
+#         cell = table.find("td")
+#         if cell:
+#             values = [line.strip()
+#                       for line in cell.stripped_strings if line.strip()]
+#     return values
 def extract_list_data(soup, table_class):
-    table = soup.find("table", {"class": table_class})
+    ul = soup.find("ul", {"class": table_class})
     values = []
-    if table:
-        cell = table.find("td")
-        if cell:
-            values = [line.strip()
-                      for line in cell.stripped_strings if line.strip()]
-    return values
 
+    if ul:
+        items = ul.find_all("li")
+
+        for item in items:
+            text = " ".join(item.stripped_strings)
+            values.append(text)
+
+    return values
 
 def extract_fir_details(soup, table_class):
     table = soup.find(
@@ -177,7 +201,7 @@ def extract_case_history(soup):
         if len(cols) >= 4:
             history.append({
                 "judge": cols[0].text.strip(),
-                "businessOnDate": cols[1].find("a").text.strip() if cols[1].find("a") else "",
+                "businessOnDate": cols[1].find("a").text.strip() if cols[1].find("a") else cols[2].text.strip(),
                 "hearingDate": cols[2].text.strip(),
                 "purpose": cols[3].text.strip(),
                 "inputType": "automatic",
@@ -360,9 +384,12 @@ def fetch_submit_info(case_data: CaseRequest):
         "court_complex_code": query.get("court_complex_code")
     }
     existing_case = collection.find_one(ac_query)
-    if existing_case:
+
+    if existing_case and case_data.refresh == "0":
         existing_case["_id"] = str(existing_case["_id"])
-        return JSONResponse(content=existing_case)
+        return JSONResponse(content=jsonable_encoder(existing_case))
+
+    existing_case_id = existing_case["_id"] if existing_case else None
     
     session = requests.Session()
     case_info = {}
@@ -442,9 +469,9 @@ def fetch_submit_info(case_data: CaseRequest):
                     case_details = extract_table_data(
                         soup, "table case_details_table table-bordered")
                     case_petitioner = {"petitioner_and_advocate": extract_list_data(
-                        soup, "table table-bordered Petitioner_Advocate_table")}
+                        soup, "table table-bordered Petitioner_Advocate_table petitioner-advocate-list border")}
                     case_respondent = {"respondent_and_advocate": extract_list_data(
-                        soup, "table table-bordered Respondent_Advocate_table")}
+                        soup, "table table-bordered Respondent_Advocate_table respondent-advocate-list border")}
                     case_fir_details = {"fir_details": extract_fir_details(
                         soup, "FIR_details_table")}
                     acts_and_sections = extract_acts_and_sections(soup)
@@ -476,10 +503,19 @@ def fetch_submit_info(case_data: CaseRequest):
                                       **case_respondent, **acts_and_sections, **case_history, **case_transfer,"s3_prefix" : case_json_s3_path, "orders": orders}
 
                     
-                    insert_result = collection.insert_one(final_response)
-                    final_response["_id"] = str(insert_result.inserted_id)
+                    if existing_case_id:
+                        collection.update_one(
+                            {"_id": existing_case_id},
+                            {"$set": final_response}
+                        )
+                        final_response["_id"] = str(existing_case_id)
+                    else:
+                        insert_result = collection.insert_one(
+                            {**final_response}
+                        )
+                        final_response["_id"] = str(insert_result.inserted_id)
 
-                    return JSONResponse(content=final_response)
+                    return JSONResponse(content=final_response, status_code=200)
                 else:
                     return JSONResponse(content={"error": "Failed to fetch case details"}, status_code=403)
 
@@ -583,6 +619,8 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
 
         existing_case = collection.find_one(ac_query)
 
+        # print("existing case-------------------->", ac_query)
+
         if existing_case and single_case.refresh == "0":
             existing_case["_id"] = str(existing_case["_id"])
             return JSONResponse(content=jsonable_encoder(existing_case))
@@ -628,8 +666,8 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
 
         case_status = extract_table_data(soup, "table case_status_table table-bordered")
         case_details = extract_table_data(soup, "table case_details_table table-bordered")
-        case_petitioner = {"petitioner_and_advocate": extract_list_data(soup, "table table-bordered Petitioner_Advocate_table")}
-        case_respondent = {"respondent_and_advocate": extract_list_data(soup, "table table-bordered Respondent_Advocate_table")}
+        case_petitioner = {"petitioner_and_advocate": extract_list_data(soup, "table table-bordered Petitioner_Advocate_table petitioner-advocate-list border")}
+        case_respondent = {"respondent_and_advocate": extract_list_data(soup, "table table-bordered Respondent_Advocate_table respondent-advocate-list border")}
         case_fir_details = {"fir_details": extract_fir_details(soup, "FIR_details_table")}
         acts_and_sections = extract_acts_and_sections(soup)
         case_history = {"case_history": extract_case_history(soup)}
@@ -668,6 +706,7 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
             "s3_prefix": case_json_s3_path,
             "orders": orders
         }
+        print("final_response",final_response)
 
         if existing_case_id:
             collection.update_one(
