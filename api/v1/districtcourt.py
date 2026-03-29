@@ -619,7 +619,7 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
 
         # print("existing case-------------------->", ac_query)
 
-        if existing_case and single_case.refresh == "0":
+        if existing_case:
             existing_case["_id"] = str(existing_case["_id"])
             return JSONResponse(content=jsonable_encoder(existing_case))
 
