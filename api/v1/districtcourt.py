@@ -61,9 +61,6 @@ def build_case_base_path(metadata: dict):
         f"{metadata['cino']}/"
     )
 
-def build_orders_prefix(metadata: dict):
-    return build_case_base_path(metadata) + "orders/"
-
 def build_case_json_key(metadata: dict):
     return build_case_base_path(metadata) + "metadata.json"
 

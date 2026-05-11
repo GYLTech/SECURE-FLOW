@@ -3,10 +3,10 @@ import sentry_sdk
 from api.v1 import districtcourt, hc2, cc, nclt,sci
 app = FastAPI(title="Secure Flow By GYL")
 
-sentry_sdk.init(
-    dsn="https://d5ba717dbd1a1f3eec57fb1ec6798284@o4508364047712256.ingest.us.sentry.io/4510724946853888",
-    send_default_pii=True,
-)
+# sentry_sdk.init(
+#     dsn="https://d5ba717dbd1a1f3eec57fb1ec6798284@o4508364047712256.ingest.us.sentry.io/4510724946853888",
+#     send_default_pii=True,
+# )
 
 @app.get("/")
 async def root():

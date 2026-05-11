@@ -1,16 +1,21 @@
 import json
+import random
+import time
 from typing import Optional
 import requests
 from bs4 import BeautifulSoup
 from fastapi import APIRouter, FastAPI
 from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
 import re
 from pydantic import BaseModel
 from pymongo import MongoClient
 from dotenv import load_dotenv
 import os
 from core.s3_client import s3_client
+from core.database import collection
 from core.lambda_client import lambda_client
+from http.client import RemoteDisconnected
 
 load_dotenv()
 
@@ -26,6 +31,43 @@ REGION_NAME = os.getenv("REGION_NAME")
 app = APIRouter()
 MAX_RETRIES = 5
 
+
+def build_case_base_path(case_data: dict):
+    return (
+        f"cases/"
+        f"{case_data['courtType']}/"
+        f"{case_data['state_code']}/"
+        f"{case_data['dist_code']}/"
+        f"{case_data['court_complex_code']}/"
+        f"{case_data['rgyear']}/"
+        f"{case_data['cino']}/"
+    )
+
+def build_orders_prefix(metadata: dict):
+    return build_case_base_path(metadata) + "orders/"
+
+def build_case_json_key(metadata: dict):
+    return build_case_base_path(metadata) + "metadata.json"
+
+def upload_case_json_to_s3(
+    s3_client,
+    bucket_name,
+    metadata
+):
+    key = build_case_json_key(metadata)
+
+    payload = {
+        **metadata
+    }
+
+    s3_client.put_object(
+        Bucket=bucket_name,
+        Key=key,
+        Body=json.dumps(payload, ensure_ascii=False),
+        ContentType="application/json"
+    )
+
+    return f"s3://{bucket_name}/{key}"
 
 def solve_captcha(lambda_client, image_url):
     payload = {
@@ -73,14 +115,64 @@ def extract_case_data(html_content: str, case_status: str):
 
     return results
 
+def safe_post(session, url, data, max_retries=5):
+    for attempt in range(max_retries):
+        try:
+            time.sleep(random.uniform(1.5, 2.0))
+
+            response = session.post(
+                url,
+                data=data,
+                timeout=(30, 180),
+                headers={"Connection": "close"}
+            )
+            return response
+
+        except (requests.exceptions.ConnectionError, RemoteDisconnected) as e:
+            print(f"⚠️ Server disconnected (attempt {attempt+1})")
+
+            session.close()
+            session = requests.Session()
+
+        except requests.exceptions.Timeout:
+            print(f"⚠️ Timeout (attempt {attempt+1})")
+
+    raise Exception("❌ eCourts viewHistory failed after retries")
+
+def safe_get(session, url, params=None, max_retries=5,headers=None):
+    for attempt in range(max_retries):
+        try:
+            time.sleep(random.uniform(1.5, 2.0))
+
+            response = session.get(
+                url,
+                params=params,
+                timeout=(30, 180),
+                headers=headers
+            )
+
+            return response
+
+        except (requests.exceptions.ConnectionError, RemoteDisconnected) as e:
+            print(f"⚠️ Server disconnected (attempt {attempt + 1})")
+
+            session.close()
+            session = requests.Session()
+
+        except requests.exceptions.Timeout:
+            print(f"⚠️ Timeout (attempt {attempt + 1})")
+
+    raise Exception("❌ GET request failed after retries")
+
 
 class CaseRequest(BaseModel):
-    diary_year: str
-    diary_no: str
+    rgyear: str
+    case_no: str
     state_code: Optional[str] = None
     dist_code: Optional[str] = None
     court_complex_code: Optional[str] = None
     est_code: Optional[str] = None
+    refresh: str = "1"
 
 
 class CaseRequestAOR(BaseModel):
@@ -149,7 +241,7 @@ def extract_table_with_headers(soup, className=None, headers=None):
     return extracted_data
 
 
-def parse_case_history(html, data, session):
+def parse_case_history(html, data):
 
     soup = BeautifulSoup(html, "html.parser")
     case_labels = ["Diary Number", "Case Number", "CNR Number", "Filed On"]
@@ -168,7 +260,7 @@ def parse_case_history(html, data, session):
         "cino": case_data.get("CNR Number", ""),
         "state_code": data.state_code,
         "court_complex_code": data.court_complex_code,
-        "rgyear": data.diary_year,
+        "rgyear": data.rgyear,
         "case_type": caseTy,
         "dist_code": data.dist_code,
         "CNRNumber": case_data.get("CNR Number", ""),
@@ -176,16 +268,16 @@ def parse_case_history(html, data, session):
         "CaseType": caseTy,
         "CourtNumberandJudge": judge_match.group(2).replace("and", ", ") if judge_match else None,
         "DecisionDate": None,
-        "FilingNumber": data.diary_no + "/" + data.diary_year,
+        "FilingNumber": data.case_no + "/" + data.rgyear,
         "NatureofDisposal": None,
-        "RegistrationNumber": data.diary_no + "/" + data.diary_year,
+        "RegistrationNumber": data.case_no + "/" + data.rgyear,
         "actsandSection": {
             "acts": status_data.get("Category", ""),
             "section": None
         },
         "case_history": [],
-        "case_no": data.diary_no,
-        "courtType": "sci",
+        "case_no": data.case_no,
+        "courtType": "supremecourt",
         "court_code": data.court_complex_code,
         "orders": [],
         "petitioner_and_advocate": parties.get("petitioner", []),
@@ -196,11 +288,27 @@ def parse_case_history(html, data, session):
 
 @app.post("/sci/getcaseInfo")
 def fetch_submit_info(case_data: CaseRequest):
+    query = case_data.dict()
+    ac_query = {
+        "courtType": "supremecourt",
+        "case_no": query.get("case_no"),
+        "state_code": query.get("state_code"),
+        "dist_code": query.get("dist_code"),
+        "rgyear": query.get("rgyear")
+    }
+    existing_case = collection.find_one(ac_query)
+
+    if existing_case and case_data.refresh == "0":
+        existing_case["_id"] = str(existing_case["_id"])
+        return JSONResponse(content=jsonable_encoder(existing_case))
+    
+    existing_case_id = existing_case["_id"] if existing_case else None
+
     session = requests.Session()
     try:
         payload = {
-            'diary_no': case_data.diary_no,
-            'diary_year': case_data.diary_year,
+            'diary_no': case_data.case_no,
+            'diary_year': case_data.rgyear,
             'action': "get_case_details",
             'es_ajax_request': '1',
             'language': 'en'
@@ -210,15 +318,15 @@ def fetch_submit_info(case_data: CaseRequest):
             'x-requested-with': 'XMLHttpRequest'
         }
 
-        response = session.get(BASE_URL, params=payload, headers=headers)
+        response = safe_get(session, BASE_URL, params=payload, headers=headers)
         response_json = response.json()
         data_value = response_json.get("data")
         if not data_value or "No records found" in str(data_value):
             return JSONResponse(content={"error": "Invalid Case Details"}, status_code=404)
 
-        listing_response = session.get(BASE_URL, params={
-            'diary_no': case_data.diary_no,
-            'diary_year': case_data.diary_year,
+        listing_response = safe_get(session, BASE_URL, params={
+            'diary_no': case_data.case_no,
+            'diary_year': case_data.rgyear,
             'tab_name': "listing_dates",
             'action': "get_case_details",
             'es_ajax_request': '1',
@@ -226,9 +334,9 @@ def fetch_submit_info(case_data: CaseRequest):
         }, headers=headers)
         listing_html = listing_response.json().get("data", "")
 
-        order_response = session.get(BASE_URL, params={
-            'diary_no': case_data.diary_no,
-            'diary_year': case_data.diary_year,
+        order_response = safe_get(session, BASE_URL, params={
+            'diary_no': case_data.case_no,
+            'diary_year': case_data.rgyear,
             'tab_name': "judgement_orders",
             'action': "get_case_details",
             'es_ajax_request': '1',
@@ -236,7 +344,7 @@ def fetch_submit_info(case_data: CaseRequest):
         }, headers=headers)
         order_html = order_response.json().get("data", "")
 
-        result = parse_case_history(data_value, case_data, session)
+        result = parse_case_history(data_value, case_data)
 
         case_history = []
         if listing_html:
@@ -254,6 +362,11 @@ def fetch_submit_info(case_data: CaseRequest):
                         "lawyerRemark": cols[7] if len(cols) > 7 else "null"
                     })
         result["case_history"] = case_history
+        orders_prefix = build_case_base_path(result) + "orders/"
+        case_json_s3_path = upload_case_json_to_s3(
+        s3_client,"dl-shared-gyl-vidilekh",result
+        )
+        result["s3_prefix"] = case_json_s3_path
 
         orders = []
         if order_html:
@@ -263,11 +376,10 @@ def fetch_submit_info(case_data: CaseRequest):
                 order_date = clean_text(a.text)
                 final_pdf_url = a["href"]
                 order_number = str(idx)
-                s3_folder_path = f"case_data/orders/{result['cino']}/"
-                s3_file_path = f"{s3_folder_path}{result['cino']}-{order_number}.pdf"
+                s3_key = f"{orders_prefix}order-{order_number.zfill(3)}.pdf"
                 try:
-                    s3_client.head_object(Bucket=BUCKET_NAME, Key=s3_file_path)
-                    s3_url = f"https://{BUCKET_NAME}.s3.{REGION_NAME}.amazonaws.com/{s3_file_path}"
+                    s3_client.head_object(Bucket=BUCKET_NAME, Key=s3_key)
+                    s3_url = f"https://{BUCKET_NAME}.s3.{REGION_NAME}.amazonaws.com/{s3_key}"
                 except s3_client.exceptions.ClientError as e:
                     if e.response['Error']['Code'] == "404":
                         response_pdf = session.get(final_pdf_url, stream=True)
@@ -275,13 +387,13 @@ def fetch_submit_info(case_data: CaseRequest):
                             s3_client.upload_fileobj(
                                 response_pdf.raw,
                                 BUCKET_NAME,
-                                s3_file_path,
+                                s3_key,
                                 ExtraArgs={
                                     'ContentType': 'application/pdf',
                                     'ContentDisposition': 'inline'
                                 }
                             )
-                            s3_url = f"https://{BUCKET_NAME}.s3.{REGION_NAME}.amazonaws.com/{s3_file_path}"
+                            s3_url = f"https://{BUCKET_NAME}.s3.{REGION_NAME}.amazonaws.com/{s3_key}"
                         else:
                             s3_url = None
                     else:
@@ -292,6 +404,17 @@ def fetch_submit_info(case_data: CaseRequest):
                     "order_link": s3_url
                 })
         result["orders"] = orders
+        if  existing_case_id:
+            collection.update_one(
+            {"_id": existing_case_id},
+            {"$set": result}
+            )
+            result["_id"] = str(existing_case_id)
+        else:
+            insert_result = collection.insert_one(
+            {**result}
+            )
+            result["_id"] = str(insert_result.inserted_id)
         return JSONResponse(content=result, status_code=200)
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)
