@@ -1,3 +1,4 @@
+import base64
 import json
 import random
 import time
@@ -15,7 +16,8 @@ import os
 from core.s3_client import s3_client
 from core.database import collection
 from core.lambda_client import lambda_client
-from http.client import RemoteDisconnected
+from helpers.solve_captcha import solve_captcha
+from helpers.requests import safe_get
 
 load_dotenv()
 
@@ -69,28 +71,6 @@ def upload_case_json_to_s3(
 
     return f"s3://{bucket_name}/{key}"
 
-def solve_captcha(lambda_client, image_url):
-    payload = {
-        "image_url": image_url,
-        "frm": "sci"
-    }
-
-    response = lambda_client.invoke(
-        FunctionName="GYL-MS-Swipe-Captcha-Solver-V1",
-        InvocationType="RequestResponse",
-        Payload=json.dumps(payload)
-    )
-
-    response_payload = response['Payload'].read().decode()
-    data = json.loads(response_payload)
-
-    expression = data.get("text")
-    if not expression:
-        raise ValueError("Captcha expression not found")
-
-    return eval(expression)
-
-
 def extract_case_data(html_content: str, case_status: str):
 
     soup = BeautifulSoup(html_content, "html.parser")
@@ -114,56 +94,6 @@ def extract_case_data(html_content: str, case_status: str):
         })
 
     return results
-
-def safe_post(session, url, data, max_retries=5):
-    for attempt in range(max_retries):
-        try:
-            time.sleep(random.uniform(1.5, 2.0))
-
-            response = session.post(
-                url,
-                data=data,
-                timeout=(30, 180),
-                headers={"Connection": "close"}
-            )
-            return response
-
-        except (requests.exceptions.ConnectionError, RemoteDisconnected) as e:
-            print(f"⚠️ Server disconnected (attempt {attempt+1})")
-
-            session.close()
-            session = requests.Session()
-
-        except requests.exceptions.Timeout:
-            print(f"⚠️ Timeout (attempt {attempt+1})")
-
-    raise Exception("❌ eCourts viewHistory failed after retries")
-
-def safe_get(session, url, params=None, max_retries=5,headers=None):
-    for attempt in range(max_retries):
-        try:
-            time.sleep(random.uniform(1.5, 2.0))
-
-            response = session.get(
-                url,
-                params=params,
-                timeout=(30, 180),
-                headers=headers
-            )
-
-            return response
-
-        except (requests.exceptions.ConnectionError, RemoteDisconnected) as e:
-            print(f"⚠️ Server disconnected (attempt {attempt + 1})")
-
-            session.close()
-            session = requests.Session()
-
-        except requests.exceptions.Timeout:
-            print(f"⚠️ Timeout (attempt {attempt + 1})")
-
-    raise Exception("❌ GET request failed after retries")
-
 
 class CaseRequest(BaseModel):
     rgyear: str
@@ -428,22 +358,11 @@ def fetch_submit_info(case_data: CaseRequestAOR):
 
     try:
         for attempt in range(1, MAX_RETRIES + 1):
-
-            lambda_payload = {
-                "image_url": "https://www.sci.gov.in/?_siwp_captcha&id=hojd0afgm07crqxwenrybr345qnurmjr1iu1mvgm",
-                "frm": "sci"
-            }
-
-            lambda_response = lambda_client.invoke(
-                FunctionName="GYL-MS-Swipe-Captcha-Solver-V1",
-                InvocationType="RequestResponse",
-                Payload=json.dumps(lambda_payload)
-            )
-
-            response_payload = lambda_response["Payload"].read().decode()
-            lambda_data = json.loads(response_payload)
-
-            expression = lambda_data.get("text")
+            captcha_response = safe_get(session=session,url="https://www.sci.gov.in/?_siwp_captcha&id=hojd0afgm07crqxwenrybr345qnurmjr1iu1mvgm")
+            image_base64 = base64.b64encode(
+                captcha_response.content
+            ).decode("utf-8")
+            expression = solve_captcha(lambda_client=lambda_client,image_base64=image_base64,frm="sci") 
             if not expression:
                 continue
 

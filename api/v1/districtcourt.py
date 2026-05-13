@@ -148,15 +148,7 @@ def extract_table_data(soup, table_class):
 
     return sanitize_keys(data)
 
-# def extract_list_data(soup, table_class):
-#     table = soup.find("table", {"class": table_class})
-#     values = []
-#     if table:
-#         cell = table.find("td")
-#         if cell:
-#             values = [line.strip()
-#                       for line in cell.stripped_strings if line.strip()]
-#     return values
+
 def extract_list_data(soup, table_class):
     ul = soup.find("ul", {"class": table_class})
     values = []

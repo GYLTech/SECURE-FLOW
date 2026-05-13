@@ -1,3 +1,5 @@
+import base64
+
 import requests
 from bs4 import BeautifulSoup
 from fastapi import APIRouter
@@ -8,6 +10,9 @@ from typing import Optional
 from dotenv import load_dotenv
 from core.database import collection
 from core.s3_client import s3_client
+from helpers.solve_captcha import solve_captcha
+from core.lambda_client import lambda_client
+from helpers.requests import safe_get,safe_post
 import os
 import html
 load_dotenv()
@@ -16,7 +21,7 @@ REGION_NAME = os.getenv("REGION_NAME")
 BASE_URL = "https://hcservices.ecourts.gov.in/hcservices/"
 
 app = APIRouter()
-
+MAX_RETRIES = 5
 
 class CaseRequest(BaseModel):
     case_type: str
@@ -28,14 +33,11 @@ class CaseRequest(BaseModel):
     est_code: Optional[str] = None
     refresh_flag: str
 
-class CaseRequestBulk(BaseModel):
-    petres_name: str
-    rgyearP: str
-    case_status: str
+class CaseAdvocateBulk(BaseModel):
     state_code: str
     dist_code: str
-    court_complex_code: str
-    est_code: Optional[str] = None
+    court_code: str
+    advocate_name: str
     courtType: Optional[str] = None
 
 
@@ -336,6 +338,74 @@ def fetch_submit_hc_info(case_data: CaseRequest):
                 testdata["_id"] = str(doc["_id"])
 
         return testdata
+
+    finally:
+        session.close()
+
+
+@app.post("/hc/bulk_q/advname")
+def fetch_submit_info(case_data: CaseAdvocateBulk):
+    session = requests.Session()
+
+    try:
+        for attempt in range(1, MAX_RETRIES + 1):
+            print("entering here")
+            captcha_response = safe_get(session=session,url="https://hcservices.ecourts.gov.in/ecourtindiaHC/securimage/securimage_show.php")
+            image_base64 = base64.b64encode(
+                captcha_response.content
+            ).decode("utf-8")
+            expression = solve_captcha(lambda_client=lambda_client,image_base64=image_base64,frm="hc")
+            if not expression:
+                continue
+            
+            payload = {
+                "party_type": "any",
+                "action_code": "showRecords",
+                "state_code": case_data.state_code,
+                "dist_code": case_data.dist_code,                
+                "court_code" : case_data.court_code,
+                "advocate_name" : case_data.advocate_name,
+                "search_type" : "1",
+                "f" : "Both",
+                "captcha": str(expression)
+            }
+
+            print(payload)
+
+            headers = {
+            'content-type': 'application/x-www-form-urlencoded',
+            'origin': 'https://hcservices.ecourts.gov.in',
+            'referer': 'https://hcservices.ecourts.gov.in/'          
+            }
+
+            response = safe_post(session, url="https://hcservices.ecourts.gov.in/ecourtindiaHC/cases/qs_civil_advocate_qry.php", data=payload, headers=headers)
+            response_json = response.text
+            print(response_json)
+            return
+
+            if response_json.get("success") is False:
+                continue
+
+            data_value = response_json.get("data")
+            if not data_value or "No records found" in str(data_value):
+                return JSONResponse(
+                    content={"error": "Invalid Case Details"},
+                    status_code=404
+                )
+            data_value = response_json.get("data", {}).get("resultsHtml")
+            cases = extract_case_data(data_value, case_data.case_status)
+            return JSONResponse(content={
+                "success": True,
+                "data": cases
+            }, status_code=200)
+
+        return JSONResponse(
+            content={"error": "Unable to get response from SCI at this moment"},
+            status_code=404
+        )
+
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
     finally:
         session.close()
