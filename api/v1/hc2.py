@@ -1,5 +1,7 @@
 import base64
+import json
 
+from fastapi.encoders import jsonable_encoder
 import requests
 from bs4 import BeautifulSoup
 from fastapi import APIRouter
@@ -31,7 +33,7 @@ class CaseRequest(BaseModel):
     dist_code: str
     court_complex_code: str
     est_code: Optional[str] = None
-    refresh_flag: str
+    refresh: str
 
 class CaseAdvocateBulk(BaseModel):
     state_code: str
@@ -40,6 +42,53 @@ class CaseAdvocateBulk(BaseModel):
     advocate_name: str
     courtType: Optional[str] = None
 
+class CaseRequestBulkIngest(BaseModel):
+    court_code: str
+    state_code: str
+    dist_code: str
+    court_complex_code: str
+    case_no: str
+    cino: str
+    rgyear : str
+    courtType: Optional[str] = None
+    refresh : int=0
+
+def build_case_base_path(case_data: dict):
+    return (
+        f"cases/"
+        f"{case_data['courtType']}/"
+        f"{case_data['state_code']}/"
+        f"{case_data['dist_code']}/"
+        f"{case_data['court_complex_code']}/"
+        f"{case_data['rgyear']}/"
+        f"{case_data['cino']}/"
+    )
+
+def build_orders_prefix(metadata: dict):
+    return build_case_base_path(metadata) + "orders/"
+
+def build_case_json_key(metadata: dict):
+    return build_case_base_path(metadata) + "metadata.json"
+
+def upload_case_json_to_s3(
+    s3_client,
+    bucket_name,
+    metadata
+):
+    key = build_case_json_key(metadata)
+
+    payload = {
+        **metadata
+    }
+
+    s3_client.put_object(
+        Bucket=bucket_name,
+        Key=key,
+        Body=json.dumps(payload, ensure_ascii=False),
+        ContentType="application/json"
+    )
+
+    return f"s3://{bucket_name}/{key}"
 
 def clean_text(text):
     return re.sub(r"\s+", " ", text.strip())
@@ -139,7 +188,7 @@ def extract_high_court_case_history(soup):
     return history
 
 
-def extract_and_upload_orders(soup, s3_client, session, BUCKET_NAME, REGION_NAME, value):
+def extract_and_upload_orders(soup, s3_client, session, BUCKET_NAME, REGION_NAME,metadata):
     orders = []
     table = soup.find("table", class_="order_table")
 
@@ -154,19 +203,17 @@ def extract_and_upload_orders(soup, s3_client, session, BUCKET_NAME, REGION_NAME
 
         order_number = clean_text(cols[0].get_text())
         order_date = clean_text(cols[3].get_text())
-
         link_tag = cols[4].find("a", href=True)
         if not link_tag:
             continue
 
         final_pdf_url = BASE_URL + link_tag["href"]
-
-        s3_folder_path = f"case_data/orders/{value}/"
-        s3_file_path = f"{s3_folder_path}{value}-{order_number}.pdf"
-
+        
+        orders_prefix = build_case_base_path(metadata) + "orders/"
+        s3_key = f"{orders_prefix}order-{order_number.zfill(3)}.pdf"
         try:
-            s3_client.head_object(Bucket=BUCKET_NAME, Key=s3_file_path)
-            s3_url = f"https://{BUCKET_NAME}.s3.{REGION_NAME}.amazonaws.com/{s3_file_path}"
+            s3_client.head_object(Bucket=BUCKET_NAME, Key=s3_key)
+            s3_url = f"https://{BUCKET_NAME}.s3.{REGION_NAME}.amazonaws.com/{s3_key}"
         except s3_client.exceptions.ClientError as e:
             if e.response['Error']['Code'] == "404":
                 response = session.get(final_pdf_url, stream=True)
@@ -174,13 +221,13 @@ def extract_and_upload_orders(soup, s3_client, session, BUCKET_NAME, REGION_NAME
                     s3_client.upload_fileobj(
                         response.raw,
                         BUCKET_NAME,
-                        s3_file_path,
+                        s3_key,
                         ExtraArgs={
                             'ContentType': 'application/pdf',
                             'ContentDisposition': 'inline'
                         }
                     )
-                    s3_url = f"https://{BUCKET_NAME}.s3.{REGION_NAME}.amazonaws.com/{s3_file_path}"
+                    s3_url = f"https://{BUCKET_NAME}.s3.{REGION_NAME}.amazonaws.com/{s3_key}"
                 else:
                     print(f"❌ Failed to fetch PDF from {final_pdf_url}")
                     s3_url = None
@@ -197,7 +244,7 @@ def extract_and_upload_orders(soup, s3_client, session, BUCKET_NAME, REGION_NAME
     return orders
 
 
-def parse_case_history(html, payload, second_payload, value, session):
+def parse_case_history(html, payload, second_payload,session):
     soup = BeautifulSoup(html, "html.parser")
 
     case_details = extract_table_data(soup, "Case Details", [
@@ -224,24 +271,16 @@ def parse_case_history(html, payload, second_payload, value, session):
         soup, "Category", ["Category", "Sub Category"])
     subordinate_court_info = extract_subordinate_court_info(soup)
     high_court_case_history = extract_high_court_case_history(soup)
-    orders_hc = extract_and_upload_orders(
-        soup,
-        s3_client=s3_client,
-        session=session,
-        BUCKET_NAME=BUCKET_NAME,
-        REGION_NAME=REGION_NAME,
-        value=value
-    )
-
-    return {
+    metadata = {
         "case_no": second_payload.get("case_no"),
+        "courtType" : "highcourt",
         "case_reg_no": payload.get("case_no"),
         "rgyear": payload.get("rgyear"),
         "cino": second_payload.get("cino"),
         "court_code": payload.get("court_code"),
         "state_code": payload.get("state_code"),
         "dist_code": payload.get("dist_code"),
-        "court_complex_code": payload.get("court_complex_code"),
+        "court_complex_code": payload.get("court_code"),
         "est_code": payload.get("est_code"),
         "case_type": payload.get("case_type"),
         "CaseType": payload.get("CaseType"),
@@ -258,8 +297,23 @@ def parse_case_history(html, payload, second_payload, value, session):
         "subordinate_court_information": subordinate_court_info,
         "case_history": high_court_case_history,
         "case_transfer": [],
-        "orders": orders_hc
+        "orders" : []
     }
+    case_json_s3_path = upload_case_json_to_s3(
+        s3_client,"dl-shared-gyl-vidilekh",metadata=metadata
+        )
+    metadata["s3_prefix"] = case_json_s3_path
+    orders_hc = extract_and_upload_orders(
+        soup,
+        s3_client=s3_client,
+        session=session,
+        BUCKET_NAME="dl-shared-gyl-vidilekh",
+        REGION_NAME=REGION_NAME,
+        metadata=metadata
+    )
+    metadata["orders"] = orders_hc
+
+    return metadata
 
 import re
 
@@ -280,11 +334,11 @@ def extract_case_data(case_data,raw_text):
         if not record:
             continue
 
-        parts = record.split("~")
+        parts = [p.strip() for p in record.split("~") if p.strip()]
 
         if len(parts) < 8:
             continue
-
+        
         case_info = {
             "case_no": parts[0].encode("utf-8").decode("utf-8-sig"),
             "case_number": parts[1].strip(),
@@ -293,22 +347,9 @@ def extract_case_data(case_data,raw_text):
             "dist_code": case_data.dist_code,                
             "court_code" : case_data.court_code,
             "courtType" : case_data.courtType,
+            "rgyear" : parts[1].strip().split("/")[-1] if "/" in parts[1].strip() else None,
+            "party_details": re.sub(r'<br\s*/?>', ' ', parts[2]).strip()
         }
-
-
-        party_text = re.sub(
-            r"<br\s*/?>",
-            " ",
-            parts[2].replace("<br />", " ").strip()
-        )
-
-        party_text = re.sub(
-            r"\s+",
-            " ",
-            party_text
-        ).strip()
-
-        case_info["party_details"] = party_text
 
         results.append(case_info)
 
@@ -316,7 +357,6 @@ def extract_case_data(case_data,raw_text):
 
 @app.post("/hc2/getcaseInfo")
 def fetch_submit_hc_info(case_data: CaseRequest):
-    session = requests.Session()
     query = case_data.dict()
     ac_query = {
         "case_reg_no": query.get("case_reg_no"),
@@ -327,12 +367,14 @@ def fetch_submit_hc_info(case_data: CaseRequest):
         "dist_code": query.get("dist_code"),
         "court_complex_code": query.get("court_complex_code")
     }
-    if case_data.refresh_flag != "1":
-        existing_case = collection.find_one(ac_query)
-        if existing_case:
-            existing_case["_id"] = str(existing_case["_id"])
-            return JSONResponse(content=existing_case)
+    existing_case = collection.find_one(ac_query)
 
+    if existing_case and case_data.refresh == "0":
+        existing_case["_id"] = str(existing_case["_id"])
+        return JSONResponse(content=jsonable_encoder(existing_case))
+    
+    existing_case_id = existing_case["_id"] if existing_case else None
+    session = requests.Session()
     try:
         payload = {
             "action_code": "showRecords",
@@ -351,9 +393,7 @@ def fetch_submit_hc_info(case_data: CaseRequest):
             'content-type': 'application/x-www-form-urlencoded',
             'origin': 'https://hcservices.ecourts.gov.in',
         }
-        response = session.post(
-            "https://hcservices.ecourts.gov.in/ecourtindiaHC/cases/case_no_qry.php", headers=headers, data=payload)
-        
+        response = safe_post(session=session, url="https://hcservices.ecourts.gov.in/ecourtindiaHC/cases/case_no_qry.php", headers=headers, data=payload)
         clean_text = response.text.lstrip('\ufeff').replace("<br/>", " ")
         decoded = html.unescape(html.unescape(clean_text)).strip()
         values = decoded.split("~")
@@ -373,24 +413,26 @@ def fetch_submit_hc_info(case_data: CaseRequest):
                 'Referer': 'https://hcservices.ecourts.gov.in/',
                 'Content-Type': 'application/x-www-form-urlencoded',
             }
-        second_resp = session.post(
-                "https://hcservices.ecourts.gov.in/hcservices/cases_qry/o_civil_case_history.php",
-                data=second_payload,
-                headers=headers
+        second_resp = safe_post(session=session,url="https://hcservices.ecourts.gov.in/hcservices/cases_qry/o_civil_case_history.php",data=second_payload,headers=headers)
+
+        result = parse_case_history(
+                second_resp.text, payload, second_payload, session=session)
+        
+        if  existing_case_id:
+            collection.update_one(
+            {"_id": existing_case_id},
+            {"$set": result}
             )
-
-        testdata = parse_case_history(
-                second_resp.text, payload, second_payload, values[3], session)
-        result = collection.update_one(
-                ac_query, {"$set": testdata}, upsert=True)
-        if result.upserted_id:
-                testdata["_id"] = str(result.upserted_id)
+            result["_id"] = str(existing_case_id)
         else:
-                doc = collection.find_one(ac_query)
-                testdata["_id"] = str(doc["_id"])
-
-        return testdata
-
+            insert_result = collection.insert_one(
+            {**result}
+            )
+            result["_id"] = str(insert_result.inserted_id)
+        return JSONResponse(content=result, status_code=200)
+    
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
     finally:
         session.close()
 
@@ -420,7 +462,6 @@ def fetch_submit_info(case_data: CaseAdvocateBulk):
                 "f" : "Both",
                 "captcha": str(expression)
             }
-            print(payload)
 
             headers = {
             'content-type': 'application/x-www-form-urlencoded',
@@ -429,7 +470,6 @@ def fetch_submit_info(case_data: CaseAdvocateBulk):
             }
 
             response = safe_post(session, url="https://hcservices.ecourts.gov.in/ecourtindiaHC/cases/qs_civil_advocate_qry.php", data=payload, headers=headers)
-            print(response.text)
             if "error1" in response.text:
                 return JSONResponse(content={"error": "Invalid case details"}, status_code=404)
             
@@ -439,9 +479,6 @@ def fetch_submit_info(case_data: CaseAdvocateBulk):
                 status_code=200
             )
             
-            
-            
-
         return JSONResponse(
             content={"error": "Unable to get response from SCI at this moment"},
             status_code=404
@@ -452,3 +489,78 @@ def fetch_submit_info(case_data: CaseAdvocateBulk):
 
     finally:
         session.close()
+
+@app.post("/hc2/bulk_i")
+def fetch_submit_hc_info(case_data: CaseRequestBulkIngest):
+    query = case_data.dict()
+    ac_query = {
+            "courtType": "highcourt",
+            "cino": query.get("cino"),
+            "rgyear": query.get("rgyear"),
+            "court_code": query.get("court_code"),
+            "state_code": query.get("state_code"),
+            "dist_code": query.get("dist_code"),
+            "court_complex_code": query.get("court_complex_code"),
+            "case_reg_no" : query.get("case_no")
+        }
+   
+    existing_case = collection.find_one(ac_query)
+
+    if existing_case and case_data.refresh == 0:
+        existing_case["_id"] = str(existing_case["_id"])
+        return JSONResponse(content=jsonable_encoder(existing_case))
+    
+    existing_case_id = existing_case["_id"] if existing_case else None
+    session = requests.Session()
+    try:
+        payload = {
+            "state_code": case_data.state_code,
+            "dist_code": case_data.dist_code,
+            "case_no": case_data.case_no,
+            "court_code": case_data.court_complex_code,
+            "courtType" : "highcourt",
+            "rgyear" : case_data.rgyear
+        }
+
+        print(payload)
+
+        headers = {
+            'content-type': 'application/x-www-form-urlencoded',
+            'origin': 'https://hcservices.ecourts.gov.in',
+        }
+        
+        second_payload = {
+                "court_code": case_data.court_complex_code,
+                "state_code": case_data.state_code,
+                "court_complex_code": case_data.court_complex_code,
+                "case_no": case_data.case_no,
+                "cino": case_data.cino,
+            }
+        headers = {
+                'Origin': 'https://hcservices.ecourts.gov.in',
+                'Referer': 'https://hcservices.ecourts.gov.in/',
+                'Content-Type': 'application/x-www-form-urlencoded',
+            }
+        second_resp = safe_post(session=session,url="https://hcservices.ecourts.gov.in/hcservices/cases_qry/o_civil_case_history.php",data=second_payload,headers=headers)
+
+        result = parse_case_history(
+                second_resp.text, payload, second_payload, session=session)
+        
+        if  existing_case_id:
+            collection.update_one(
+            {"_id": existing_case_id},
+            {"$set": result}
+            )
+            result["_id"] = str(existing_case_id)
+        else:
+            insert_result = collection.insert_one(
+            {**result}
+            )
+            result["_id"] = str(insert_result.inserted_id)
+        return JSONResponse(content=result, status_code=200)
+    
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+    finally:
+        session.close()
+

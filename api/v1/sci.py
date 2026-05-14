@@ -1,7 +1,5 @@
 import base64
 import json
-import random
-import time
 from typing import Optional
 import requests
 from bs4 import BeautifulSoup

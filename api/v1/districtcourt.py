@@ -606,8 +606,6 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
 
         existing_case = collection.find_one(ac_query)
 
-        # print("existing case-------------------->", ac_query)
-
         if existing_case:
             existing_case["_id"] = str(existing_case["_id"])
             return JSONResponse(content=jsonable_encoder(existing_case))
@@ -693,7 +691,7 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
             "s3_prefix": case_json_s3_path,
             "orders": orders
         }
-        # print("final_response",final_response)
+    
 
         if existing_case_id:
             collection.update_one(
