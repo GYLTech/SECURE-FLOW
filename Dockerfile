@@ -1,13 +1,12 @@
-FROM python:3.12-slim
+    FROM python:3.12-slim
 
-WORKDIR /app
+    WORKDIR /app
 
-COPY . .
+    COPY . .
 
-RUN pip install -r requirements.txt
+    RUN pip install -r requirements.txt
 
-COPY . .
 
-EXPOSE 8000
+    EXPOSE 8000
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "2", "-b", "0.0.0.0:8000", "app:app"]

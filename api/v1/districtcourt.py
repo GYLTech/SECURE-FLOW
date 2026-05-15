@@ -48,6 +48,7 @@ class CaseRequestBulkIngest(BaseModel):
     est_code: Optional[str] = None
     rgyear: str
     courtType: Optional[str] = None
+    refresh: int = 0
 
 
 def build_case_base_path(metadata: dict):
@@ -606,7 +607,7 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
 
         existing_case = collection.find_one(ac_query)
 
-        if existing_case:
+        if existing_case and single_case.refresh == 0:
             existing_case["_id"] = str(existing_case["_id"])
             return JSONResponse(content=jsonable_encoder(existing_case))
 
