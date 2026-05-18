@@ -3,7 +3,7 @@ version: 0.2
 env:
   variables:
     AWS_DEFAULT_REGION: ap-south-1
-    ECR_REPOSITORY: secureflow
+    ECR_REPOSITORY: richstream/secureflow
 
 phases:
   pre_build:
@@ -42,7 +42,7 @@ phases:
 
       - echo Writing image definitions file...
 
-      - printf '[{"name":"secureflow","imageUri":"%s"}]' $REPOSITORY_URI:$IMAGE_TAG > imagedefinitions.json
+      - printf '[{"name":"richstream/secureflow","imageUri":"%s"}]' $REPOSITORY_URI:$IMAGE_TAG > imagedefinitions.json
 
 artifacts:
   files:
