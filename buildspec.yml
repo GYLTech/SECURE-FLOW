@@ -19,9 +19,7 @@ phases:
 
       - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
 
-      - TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
-
-      - IMAGE_TAG=$TIMESTAMP-$COMMIT_HASH
+      - IMAGE_TAG=$COMMIT_HASH
 
       - REPO_URI=$ECR_BASE_URI/$REPO_NAME
 
