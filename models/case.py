@@ -49,6 +49,7 @@ class CaseDocument(BaseModel):
     e_Filno: str = Field(alias="e-Filno")
     FirstHearingDate: str
     NextHearingDate: str
+    NatureofDisposal : str
     CaseStage: str
     CourtNumberandJudge: str
     petitioner_and_advocate: List[str]

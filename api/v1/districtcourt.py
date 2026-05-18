@@ -130,25 +130,38 @@ def extract_table_data(soup, table_class):
         rows = table.find_all("tr")
 
         for row in rows:
+            cells = row.find_all(["th", "td"])
+
+            if not cells:
+                continue
+
             headers = row.find_all("th")
             values = row.find_all("td")
 
-            for h, v in zip(headers, values):
-                key = h.get_text(strip=True).replace(":", "")
-                key = "".join(key.split())  
+            if headers and values:
+                for h, v in zip(headers, values):
+                    key = h.get_text(strip=True).replace(":", "")
+                    key = "".join(key.split())
+                    value = v.get_text(" ", strip=True)
 
-                value = v.get_text(strip=True)
+                    if "CNR" in key:
+                        span = v.find("span")
+                        if span:
+                            value = span.get_text(strip=True)
 
-                if "CNR" in key:
-                    span = v.find("span")
-                    if span:
-                        value = span.get_text(strip=True)
+                    if key:
+                        data[key] = value
+                        
+            elif len(cells) >= 2:
+                key = cells[0].get_text(" ", strip=True).replace(":", "")
+                key = "".join(key.split())
+
+                value = cells[1].get_text(" ", strip=True)
 
                 if key:
                     data[key] = value
 
     return sanitize_keys(data)
-
 
 def extract_list_data(soup, table_class):
     ul = soup.find("ul", {"class": table_class})
