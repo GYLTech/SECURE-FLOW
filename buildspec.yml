@@ -4,11 +4,9 @@ env:
   variables:
     AWS_DEFAULT_REGION: ap-south-1
 
-    # Your ECR repository name
-    ECR_REPOSITORY: secureflow
+    ECR_REPOSITORY: richstream/secureflow
 
-    # MUST exactly match ECS container name
-    CONTAINER_NAME: secureflow
+    CONTAINER_NAME: Main
 
 phases:
   pre_build:
