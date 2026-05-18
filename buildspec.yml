@@ -3,46 +3,75 @@ version: 0.2
 env:
   variables:
     AWS_DEFAULT_REGION: ap-south-1
-    ECR_REPOSITORY: richstream/secureflow
+
+    # Your ECR repository name
+    ECR_REPOSITORY: secureflow
+
+    # MUST exactly match ECS container name
+    CONTAINER_NAME: secureflow
 
 phases:
   pre_build:
     commands:
-      - echo Logging in to Amazon ECR...
+      - echo "Logging in to Amazon ECR..."
 
       - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
-      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - echo "AWS ACCOUNT ID = $AWS_ACCOUNT_ID"
 
       - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPOSITORY
+
+      - echo "REPOSITORY URI = $REPOSITORY_URI"
+
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
 
       - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
 
       - IMAGE_TAG=${COMMIT_HASH:=latest}
 
+      - echo "IMAGE TAG = $IMAGE_TAG"
+
   build:
     commands:
-      - echo Build started on `date`
+      - echo "Build started on $(date)"
 
-      - echo Building the Docker image...
+      - echo "Building Docker image..."
 
-      - docker build -t $REPOSITORY_URI:latest .
+      - docker build -t $ECR_REPOSITORY:latest .
 
-      - docker tag $REPOSITORY_URI:latest $REPOSITORY_URI:$IMAGE_TAG
+      - docker tag $ECR_REPOSITORY:latest $REPOSITORY_URI:latest
+
+      - docker tag $ECR_REPOSITORY:latest $REPOSITORY_URI:$IMAGE_TAG
 
   post_build:
     commands:
-      - echo Build completed on `date`
+      - echo "Build completed on $(date)"
 
-      - echo Pushing the Docker images...
+      - echo "Pushing Docker images..."
 
       - docker push $REPOSITORY_URI:latest
 
       - docker push $REPOSITORY_URI:$IMAGE_TAG
 
-      - echo Writing image definitions file...
+      - echo "Creating imagedefinitions.json..."
 
-      - printf '[{"name":"richstream/secureflow","imageUri":"%s"}]' $REPOSITORY_URI:$IMAGE_TAG > imagedefinitions.json
+      - printf '[{"name":"%s","imageUri":"%s"}]' $CONTAINER_NAME $REPOSITORY_URI:$IMAGE_TAG > imagedefinitions.json
+
+      - echo "===== IMAGE DEFINITIONS ====="
+
+      - cat imagedefinitions.json
+
+      - echo "============================="
+
+      - echo "===== DEBUG VALUES ====="
+
+      - echo "CONTAINER_NAME=$CONTAINER_NAME"
+
+      - echo "REPOSITORY_URI=$REPOSITORY_URI"
+
+      - echo "IMAGE_TAG=$IMAGE_TAG"
+
+      - echo "========================"
 
 artifacts:
   files:
