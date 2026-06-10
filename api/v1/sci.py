@@ -224,6 +224,7 @@ def fetch_submit_info(case_data: CaseRequest):
         "dist_code": query.get("dist_code"),
         "rgyear": query.get("rgyear")
     }
+    print(ac_query)
     existing_case = collection.find_one(ac_query)
 
     if existing_case and case_data.refresh == 0:
