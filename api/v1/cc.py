@@ -20,7 +20,7 @@ IST = pytz.timezone("Asia/Kolkata")
 
 class CaseRequest(BaseModel):
     case_reg_no: str
-    refresh_flag: str
+    refresh: str
 
 def format_date(date_str):
     if not date_str:

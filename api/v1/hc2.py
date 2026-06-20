@@ -33,7 +33,7 @@ class CaseRequest(BaseModel):
     dist_code: str
     court_complex_code: str
     est_code: Optional[str] = None
-    refresh: str
+    refresh: int = 0
 
 class CaseAdvocateBulk(BaseModel):
     state_code: str
@@ -369,7 +369,7 @@ def fetch_submit_hc_info(case_data: CaseRequest):
     }
     existing_case = collection.find_one(ac_query)
 
-    if existing_case and case_data.refresh == "0":
+    if existing_case and case_data.refresh == 0:
         existing_case["_id"] = str(existing_case["_id"])
         return JSONResponse(content=jsonable_encoder(existing_case))
     
