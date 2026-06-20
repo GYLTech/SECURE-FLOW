@@ -361,10 +361,8 @@ def fetch_submit_hc_info(case_data: CaseRequest):
     ac_query = {
         "case_reg_no": query.get("case_reg_no"),
         "rgyear": query.get("rgyear"),
-        "est_code": query.get("est_code"),
         "case_type": query.get("case_type"),
         "state_code": query.get("state_code"),
-        "dist_code": query.get("dist_code"),
         "court_complex_code": query.get("court_complex_code")
     }
     existing_case = collection.find_one(ac_query)
