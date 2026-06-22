@@ -41,6 +41,15 @@ class CaseAdvocateBulk(BaseModel):
     court_code: str
     advocate_name: str
     courtType: Optional[str] = None
+    rgyear : str
+
+class CasePartyBulk(BaseModel):
+    rgyear:str
+    state_code: str
+    dist_code: str
+    court_code: str
+    petres_name: str
+    courtType: Optional[str] = None
 
 class CaseRequestBulkIngest(BaseModel):
     court_code: str
@@ -457,17 +466,20 @@ def fetch_submit_info(case_data: CaseAdvocateBulk):
                 "court_code" : case_data.court_code,
                 "advocate_name" : case_data.advocate_name,
                 "search_type" : "1",
+                "rgyear" : case_data.rgyear,
                 "f" : "Both",
                 "captcha": str(expression)
             }
 
             headers = {
+            'accept': '*/*',
             'content-type': 'application/x-www-form-urlencoded',
             'origin': 'https://hcservices.ecourts.gov.in',
             'referer': 'https://hcservices.ecourts.gov.in/'          
             }
 
             response = safe_post(session, url="https://hcservices.ecourts.gov.in/ecourtindiaHC/cases/qs_civil_advocate_qry.php", data=payload, headers=headers)
+            print(response.text)
             if "error1" in response.text:
                 return JSONResponse(content={"error": "Invalid case details"}, status_code=404)
             
@@ -487,6 +499,69 @@ def fetch_submit_info(case_data: CaseAdvocateBulk):
 
     finally:
         session.close()
+
+@app.post("/hc/bulk_q/partyname")
+def fetch_submit_info(case_data: CasePartyBulk):
+    session = requests.Session()
+
+    try:
+        for attempt in range(1, MAX_RETRIES + 1):
+            captcha_response = safe_get(session=session,url="https://hcservices.ecourts.gov.in/ecourtindiaHC/securimage/securimage_show.php")
+            image_base64 = base64.b64encode(
+                captcha_response.content
+            ).decode("utf-8")
+            expression = solve_captcha(lambda_client=lambda_client,image_base64=image_base64,frm="hc")
+            if not expression:
+                continue
+
+            payload = {
+                "action_code": "showRecords",
+                "rgyear" : case_data.rgyear,
+                "state_code": case_data.state_code,
+                "dist_code": case_data.dist_code,                
+                "court_code" : case_data.court_code,
+                "petres_name" : case_data.petres_name,
+                "f" : "Both",
+                "captcha": str(expression)
+            }
+
+            headers = {
+  'accept': '*/*',
+  'accept-language': 'en-US,en;q=0.9',
+  'cache-control': 'no-cache',
+  'content-type': 'application/x-www-form-urlencoded',
+  'origin': 'https://hcservices.ecourts.gov.in',
+  'referer': 'https://hcservices.ecourts.gov.in/'
+}
+
+            response = safe_post(session, url="https://hcservices.ecourts.gov.in/ecourtindiaHC/cases/ki_petres.php", data=payload, headers=headers)
+            print(f"[partyname] attempt={attempt} status={response.status_code}")
+            print(f"[partyname] response body: {response.text}")
+            if response.status_code == 403:
+                print(f"[partyname] 403 on attempt {attempt}, retrying...")
+                continue
+            if response.status_code != 200:
+                return JSONResponse(content={"error": f"Upstream returned {response.status_code}"}, status_code=502)
+            if "error1" in response.text:
+                return JSONResponse(content={"error": "Invalid case details"}, status_code=404)
+
+            results = extract_case_data(case_data,response.text)
+            return JSONResponse(
+                content={"data": results},
+                status_code=200
+            )
+            
+        return JSONResponse(
+            content={"error": "Unable to get response from Ecourts at this moment"},
+            status_code=404
+        )
+
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+    finally:
+        session.close()
+
 
 @app.post("/hc2/bulk_i")
 def fetch_submit_hc_info(case_data: CaseRequestBulkIngest):
