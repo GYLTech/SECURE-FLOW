@@ -12,7 +12,7 @@ from pymongo import MongoClient
 from dotenv import load_dotenv
 import os
 from core.s3_client import s3_client
-from core.database import collection
+from core.database import collection, save_case
 from core.lambda_client import lambda_client
 from helpers.solve_captcha import solve_captcha
 from helpers.requests import safe_get
@@ -333,17 +333,7 @@ def fetch_submit_info(case_data: CaseRequest):
                     "order_link": s3_url
                 })
         result["orders"] = orders
-        if  existing_case_id:
-            collection.update_one(
-            {"_id": existing_case_id},
-            {"$set": result}
-            )
-            result["_id"] = str(existing_case_id)
-        else:
-            insert_result = collection.insert_one(
-            {**result}
-            )
-            result["_id"] = str(insert_result.inserted_id)
+        result["_id"] = save_case(result, existing_case_id)
         return JSONResponse(content=result, status_code=200)
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)

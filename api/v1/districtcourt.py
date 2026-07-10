@@ -10,7 +10,7 @@ import re
 from pydantic import BaseModel
 from typing import List, Optional
 from dotenv import load_dotenv
-from core.database import collection
+from core.database import collection, save_case
 from core.s3_client import s3_client
 import os
 from http.client import RemoteDisconnected
@@ -505,17 +505,7 @@ def fetch_submit_info(case_data: CaseRequest):
                                       **case_respondent, **acts_and_sections, **case_history, **case_transfer,"s3_prefix" : case_json_s3_path, "orders": orders}
 
                     
-                    if existing_case_id:
-                        collection.update_one(
-                            {"_id": existing_case_id},
-                            {"$set": final_response}
-                        )
-                        final_response["_id"] = str(existing_case_id)
-                    else:
-                        insert_result = collection.insert_one(
-                            {**final_response}
-                        )
-                        final_response["_id"] = str(insert_result.inserted_id)
+                    final_response["_id"] = save_case(final_response, existing_case_id)
 
                     return JSONResponse(content=final_response, status_code=200)
                 else:
@@ -708,17 +698,7 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
         }
     
 
-        if existing_case_id:
-            collection.update_one(
-                {"_id": existing_case_id},
-                {"$set": final_response}
-            )
-            final_response["_id"] = str(existing_case_id)
-        else:
-            insert_result = collection.insert_one(
-                {**final_response}
-            )
-            final_response["_id"] = str(insert_result.inserted_id)
+        final_response["_id"] = save_case(final_response, existing_case_id)
 
         return JSONResponse(content=final_response, status_code=200)
 

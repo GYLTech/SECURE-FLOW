@@ -10,7 +10,7 @@ import re
 from pydantic import BaseModel
 from typing import Optional
 from dotenv import load_dotenv
-from core.database import collection
+from core.database import collection, save_case
 from core.s3_client import s3_client
 from helpers.solve_captcha import solve_captcha
 from core.lambda_client import lambda_client
@@ -425,17 +425,7 @@ def fetch_submit_hc_info(case_data: CaseRequest):
         result = parse_case_history(
                 second_resp.text, payload, second_payload, session=session)
         
-        if  existing_case_id:
-            collection.update_one(
-            {"_id": existing_case_id},
-            {"$set": result}
-            )
-            result["_id"] = str(existing_case_id)
-        else:
-            insert_result = collection.insert_one(
-            {**result}
-            )
-            result["_id"] = str(insert_result.inserted_id)
+        result["_id"] = save_case(result, existing_case_id)
         return JSONResponse(content=result, status_code=200)
     
     except Exception as e:
@@ -619,17 +609,7 @@ def fetch_submit_hc_info(case_data: CaseRequestBulkIngest):
         result = parse_case_history(
                 second_resp.text, payload, second_payload, session=session)
         
-        if  existing_case_id:
-            collection.update_one(
-            {"_id": existing_case_id},
-            {"$set": result}
-            )
-            result["_id"] = str(existing_case_id)
-        else:
-            insert_result = collection.insert_one(
-            {**result}
-            )
-            result["_id"] = str(insert_result.inserted_id)
+        result["_id"] = save_case(result, existing_case_id)
         return JSONResponse(content=result, status_code=200)
     
     except Exception as e:
