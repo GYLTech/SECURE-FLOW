@@ -1,5 +1,9 @@
 import base64
 import json
+import random
+import string
+import threading
+import time
 from typing import Optional
 import requests
 from bs4 import BeautifulSoup
@@ -7,7 +11,7 @@ from fastapi import APIRouter, FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 import re
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from pymongo import MongoClient
 from dotenv import load_dotenv
 import os
@@ -15,11 +19,20 @@ from core.s3_client import s3_client
 from core.database import collection, save_case
 from core.lambda_client import lambda_client
 from helpers.solve_captcha import solve_captcha
-from helpers.requests import safe_get
+from helpers.requests import safe_get, safe_post
 
 load_dotenv()
 
 BASE_URL = "https://www.sci.gov.in/wp-admin/admin-ajax.php"
+CAPTCHA_IMAGE_URL = "https://www.sci.gov.in/?_siwp_captcha&id="
+
+AOR_FORM_URL = "https://www.sci.gov.in/case-status-aor-code/"
+AOR_FORM_ID = "sciapi-services-case-status-aor-code"
+AOR_ACTION = "get_case_status_aor_code"
+
+PARTY_NAME_FORM_URL = "https://www.sci.gov.in/case-status-party-name/"
+PARTY_NAME_FORM_ID = "sciapi-services-case-status-party-name"
+PARTY_NAME_ACTION = "get_case_status_party_name"
 
 client = MongoClient(os.getenv("MONGOCLIENT"))
 db = client["gylscrdata"]
@@ -30,6 +43,8 @@ REGION_NAME = os.getenv("REGION_NAME")
 
 app = APIRouter()
 MAX_RETRIES = 5
+FORM_CACHE_TTL = 6 * 60 * 60
+NONCE_FAILURE = "Nonce Verification Failed"
 
 
 def build_case_base_path(case_data: dict):
@@ -93,6 +108,143 @@ def extract_case_data(html_content: str, case_status: str):
 
     return results
 
+
+def extract_party_name_data(html_content):
+    soup = BeautifulSoup(html_content or "", "html.parser")
+    results = []
+
+    for row in soup.select("table tbody tr"):
+        cells = row.select("td")
+        if len(cells) < 6:
+            continue
+
+        petitioner = row.select_one("td.petitioners")
+        respondent = row.select_one("td.respondents")
+        link = row.select_one("a[href]")
+
+        results.append({
+            "diary_number": row.get("data-diary-no"),
+            "year": row.get("data-diary-year"),
+            "case_number": clean_text(cells[2].get_text(" ")),
+            "petitioner_name": clean_text(
+                (petitioner or cells[3]).get_text(" ")
+            ),
+            "respondent_name": clean_text(
+                (respondent or cells[4]).get_text(" ")
+            ),
+            "status": clean_text(cells[5].get_text(" ")),
+            "details_link": (
+                "https://www.sci.gov.in/" + link["href"] if link else None
+            ),
+        })
+
+    return results
+
+
+_form_cache = {}
+_form_lock = threading.Lock()
+
+CAPTCHA_EXPRESSION = re.compile(r"^(\d{1,3})\s*([+\-x*])\s*(\d{1,3})$")
+
+
+def generate_scid():
+    return "".join(
+        random.choice(string.ascii_lowercase + string.digits) for _ in range(40)
+    )
+
+
+def evaluate_captcha(expression):
+    if not expression:
+        return None
+
+    text = str(expression).strip().replace(" ", "")
+    if text.isdigit():
+        return int(text)
+
+    match = CAPTCHA_EXPRESSION.match(text)
+    if not match:
+        return None
+
+    left, operator, right = int(match.group(1)), match.group(2), int(match.group(3))
+    if operator == "+":
+        return left + right
+    if operator == "-":
+        return left - right
+    return left * right
+
+
+def scrape_form_fields(session, form_url, form_id):
+    response = safe_get(session, form_url)
+    form = BeautifulSoup(response.text, "html.parser").select_one("#" + form_id)
+    if not form:
+        raise Exception(f"SCI form {form_id} not found")
+
+    return {
+        inp.get("name"): inp.get("value", "")
+        for inp in form.select("input")
+        if inp.get("name")
+    }
+
+
+def get_form_fields(session, form_url, form_id, force_refresh=False):
+    with _form_lock:
+        cached = _form_cache.get(form_id)
+        expired = not cached or time.time() - cached["fetched_at"] > FORM_CACHE_TTL
+        if force_refresh or expired:
+            _form_cache[form_id] = {
+                "fields": scrape_form_fields(session, form_url, form_id),
+                "fetched_at": time.time(),
+            }
+        return dict(_form_cache[form_id]["fields"])
+
+
+def submit_sci_form(session, form_url, form_id, action, fields):
+    force_refresh = False
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        payload = get_form_fields(session, form_url, form_id, force_refresh=force_refresh)
+        force_refresh = False
+        payload["scid"] = generate_scid()
+
+        captcha_response = safe_get(
+            session=session,
+            url=CAPTCHA_IMAGE_URL + payload["scid"]
+        )
+        image_base64 = base64.b64encode(captcha_response.content).decode("utf-8")
+        expression = solve_captcha(
+            lambda_client=lambda_client, image_base64=image_base64, frm="sci"
+        )
+
+        result_captcha = evaluate_captcha(expression)
+        if result_captcha is None:
+            continue
+
+        payload.update(fields)
+        payload.update({
+            "siwp_captcha_value": str(result_captcha),
+            "action": action,
+            "es_ajax_request": "1",
+            "language": "en",
+        })
+
+        headers = {
+            "referer": form_url,
+            "x-requested-with": "XMLHttpRequest"
+        }
+
+        response = safe_post(session, BASE_URL, data=payload, headers=headers)
+        response_json = response.json()
+
+        if response_json.get("success") is False:
+            if NONCE_FAILURE in str(response_json.get("data", "")):
+                force_refresh = True
+            continue
+
+        return response_json
+
+    return None
+
+
 class CaseRequest(BaseModel):
     rgyear: str
     case_no: str
@@ -111,6 +263,42 @@ class CaseRequestAOR(BaseModel):
     dist_code: Optional[str] = None
     court_complex_code: Optional[str] = None
     est_code: Optional[str] = None
+
+
+class CaseRequestPartyName(BaseModel):
+    party_name: str
+    rgyear: str
+    party_status: str
+    party_type: str = "any"
+
+    @field_validator("party_name")
+    @classmethod
+    def validate_party_name(cls, value):
+        cleaned = value.strip()
+        if not re.fullmatch(r"[A-Za-z][A-Za-z .'-]*", cleaned):
+            raise ValueError("party_name must contain letters only")
+        return cleaned
+
+    @field_validator("party_status")
+    @classmethod
+    def validate_party_status(cls, value):
+        if value not in ("P", "D"):
+            raise ValueError("party_status must be 'P' or 'D'")
+        return value
+
+    @field_validator("party_type")
+    @classmethod
+    def validate_party_type(cls, value):
+        if value not in ("any", "P", "R"):
+            raise ValueError("party_type must be 'any', 'P' or 'R'")
+        return value
+
+    @field_validator("rgyear")
+    @classmethod
+    def validate_rgyear(cls, value):
+        if not re.fullmatch(r"\d{4}", value.strip()):
+            raise ValueError("rgyear must be a 4 digit year")
+        return value.strip()
 
 
 def clean_text(text):
@@ -346,57 +534,82 @@ def fetch_submit_info(case_data: CaseRequestAOR):
     session = requests.Session()
 
     try:
-        for attempt in range(1, MAX_RETRIES + 1):
-            captcha_response = safe_get(session=session,url="https://www.sci.gov.in/?_siwp_captcha&id=hojd0afgm07crqxwenrybr345qnurmjr1iu1mvgm")
-            image_base64 = base64.b64encode(
-                captcha_response.content
-            ).decode("utf-8")
-            expression = solve_captcha(lambda_client=lambda_client,image_base64=image_base64,frm="sci") 
-            if not expression:
-                continue
-
-            result_captcha = eval(expression)
-
-            payload = {
+        response_json = submit_sci_form(
+            session,
+            AOR_FORM_URL,
+            AOR_FORM_ID,
+            AOR_ACTION,
+            {
                 "party_type": "any",
                 "aor_code": case_data.aor_code,
                 "year": case_data.rgyear,
                 "case_status": case_data.case_status,
-                "scid": "hojd0afgm07crqxwenrybr345qnurmjr1iu1mvgm",
-                "siwp_captcha_value": str(result_captcha),
-                "action": "get_case_status_aor_code",
-                "es_ajax_request": "1",
-                "language": "en"
-            }
-
-            headers = {
-                "referer": "https://www.sci.gov.in/case-status-case-no/",
-                "x-requested-with": "XMLHttpRequest"
-            }
-
-            response = session.get(BASE_URL, params=payload, headers=headers)
-            response_json = response.json()
-
-            if response_json.get("success") is False:
-                continue
-
-            data_value = response_json.get("data")
-            if not data_value or "No records found" in str(data_value):
-                return JSONResponse(
-                    content={"error": "Invalid Case Details"},
-                    status_code=404
-                )
-            data_value = response_json.get("data", {}).get("resultsHtml")
-            cases = extract_case_data(data_value, case_data.case_status)
-            return JSONResponse(content={
-                "success": True,
-                "data": cases
-            }, status_code=200)
-
-        return JSONResponse(
-            content={"error": "Unable to get response from SCI at this moment"},
-            status_code=404
+            },
         )
+
+        if response_json is None:
+            return JSONResponse(
+                content={"error": "Unable to get response from SCI at this moment"},
+                status_code=404
+            )
+
+        data_value = response_json.get("data")
+        if not data_value or "No records found" in str(data_value):
+            return JSONResponse(
+                content={"error": "Invalid Case Details"},
+                status_code=404
+            )
+
+        cases = extract_case_data(data_value.get("resultsHtml"), case_data.case_status)
+        return JSONResponse(content={
+            "success": True,
+            "data": cases
+        }, status_code=200)
+
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+    finally:
+        session.close()
+
+
+@app.post("/sci/bulk_q/party_name")
+def fetch_party_name_info(case_data: CaseRequestPartyName):
+    session = requests.Session()
+
+    try:
+        response_json = submit_sci_form(
+            session,
+            PARTY_NAME_FORM_URL,
+            PARTY_NAME_FORM_ID,
+            PARTY_NAME_ACTION,
+            {
+                "party_type": case_data.party_type,
+                "party_name": case_data.party_name,
+                "year": case_data.rgyear,
+                "party_status": case_data.party_status,
+            },
+        )
+
+        if response_json is None:
+            return JSONResponse(
+                content={"error": "Unable to get response from SCI at this moment"},
+                status_code=404
+            )
+
+        data_value = response_json.get("data")
+        if not data_value or "No records found" in str(data_value):
+            return JSONResponse(
+                content={"error": "Invalid Case Details"},
+                status_code=404
+            )
+
+        cases = extract_party_name_data(data_value.get("resultsHtml"))
+        return JSONResponse(content={
+            "success": True,
+            "count": len(cases),
+            "data": cases
+        }, status_code=200)
 
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)
