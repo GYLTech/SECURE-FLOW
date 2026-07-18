@@ -41,7 +41,7 @@ class CaseAdvocateBulk(BaseModel):
     court_code: str
     advocate_name: str
     courtType: Optional[str] = None
-    rgyear : str
+    case_status : str
 
 class CasePartyBulk(BaseModel):
     rgyear:str
@@ -50,6 +50,7 @@ class CasePartyBulk(BaseModel):
     court_code: str
     petres_name: str
     courtType: Optional[str] = None
+    case_status : str
 
 class CaseRequestBulkIngest(BaseModel):
     court_code: str
@@ -440,7 +441,7 @@ def fetch_submit_info(case_data: CaseAdvocateBulk):
 
     try:
         for attempt in range(1, MAX_RETRIES + 1):
-            captcha_response = safe_get(session=session,url="https://hcservices.ecourts.gov.in/ecourtindiaHC/securimage/securimage_show.php")
+            captcha_response = safe_get(session=session,url="https://hcservices.ecourts.gov.in/ecourtindiaHC/securimage/securimage_show.php?0.026039539400995126")
             image_base64 = base64.b64encode(
                 captcha_response.content
             ).decode("utf-8")
@@ -449,6 +450,7 @@ def fetch_submit_info(case_data: CaseAdvocateBulk):
                 continue
 
             payload = {
+                "__csrf_magic" : "sid:7567188e555e8f8123a017fcb8690f2099cd60c9",
                 "party_type": "any",
                 "action_code": "showRecords",
                 "state_code": case_data.state_code,
@@ -456,8 +458,7 @@ def fetch_submit_info(case_data: CaseAdvocateBulk):
                 "court_code" : case_data.court_code,
                 "advocate_name" : case_data.advocate_name,
                 "search_type" : "1",
-                "rgyear" : case_data.rgyear,
-                "f" : "Both",
+                "f" : case_data.case_status,
                 "captcha": str(expression)
             }
 
@@ -469,10 +470,13 @@ def fetch_submit_info(case_data: CaseAdvocateBulk):
             }
 
             response = safe_post(session, url="https://hcservices.ecourts.gov.in/ecourtindiaHC/cases/qs_civil_advocate_qry.php", data=payload, headers=headers)
-            print(response.text)
+            if response.status_code == 403:
+                continue
+            if response.status_code != 200:
+                return JSONResponse(content={"error": f"Upstream returned {response.status_code}"}, status_code=502)
             if "error1" in response.text:
                 return JSONResponse(content={"error": "Invalid case details"}, status_code=404)
-            
+
             results = extract_case_data(case_data,response.text)
             return JSONResponse(
                 content={"data": results},
@@ -480,7 +484,7 @@ def fetch_submit_info(case_data: CaseAdvocateBulk):
             )
             
         return JSONResponse(
-            content={"error": "Unable to get response from SCI at this moment"},
+            content={"error": "Unable to get response from HC at this moment"},
             status_code=404
         )
 
@@ -496,7 +500,7 @@ def fetch_submit_info(case_data: CasePartyBulk):
 
     try:
         for attempt in range(1, MAX_RETRIES + 1):
-            captcha_response = safe_get(session=session,url="https://hcservices.ecourts.gov.in/ecourtindiaHC/securimage/securimage_show.php")
+            captcha_response = safe_get(session=session,url="https://hcservices.ecourts.gov.in/ecourtindiaHC/securimage/securimage_show.php?0.026039539400995126")
             image_base64 = base64.b64encode(
                 captcha_response.content
             ).decode("utf-8")
@@ -505,30 +509,26 @@ def fetch_submit_info(case_data: CasePartyBulk):
                 continue
 
             payload = {
+                "__csrf_magic" : "sid:23d31510c4c2834412b00b753ea0836fcf4f1ca8",
                 "action_code": "showRecords",
                 "rgyear" : case_data.rgyear,
                 "state_code": case_data.state_code,
                 "dist_code": case_data.dist_code,                
                 "court_code" : case_data.court_code,
                 "petres_name" : case_data.petres_name,
-                "f" : "Both",
+                "f" : case_data.case_status,
                 "captcha": str(expression)
             }
 
             headers = {
-  'accept': '*/*',
-  'accept-language': 'en-US,en;q=0.9',
-  'cache-control': 'no-cache',
-  'content-type': 'application/x-www-form-urlencoded',
-  'origin': 'https://hcservices.ecourts.gov.in',
-  'referer': 'https://hcservices.ecourts.gov.in/'
-}
-
-            response = safe_post(session, url="https://hcservices.ecourts.gov.in/ecourtindiaHC/cases/ki_petres.php", data=payload, headers=headers)
-            print(f"[partyname] attempt={attempt} status={response.status_code}")
-            print(f"[partyname] response body: {response.text}")
+            'accept': '*/*',
+            'accept-language': 'en-US,en;q=0.9',
+            'content-type': 'application/x-www-form-urlencoded',
+            'origin': 'https://hcservices.ecourts.gov.in',
+            'referer': 'https://hcservices.ecourts.gov.in/'
+            }
+            response = safe_post(session, url="https://hcservices.ecourts.gov.in/ecourtindiaHC/cases/ki_petres_qry.php", data=payload, headers=headers)
             if response.status_code == 403:
-                print(f"[partyname] 403 on attempt {attempt}, retrying...")
                 continue
             if response.status_code != 200:
                 return JSONResponse(content={"error": f"Upstream returned {response.status_code}"}, status_code=502)
@@ -584,8 +584,6 @@ def fetch_submit_hc_info(case_data: CaseRequestBulkIngest):
             "courtType" : "highcourt",
             "rgyear" : case_data.rgyear
         }
-
-        print(payload)
 
         headers = {
             'content-type': 'application/x-www-form-urlencoded',
