@@ -20,6 +20,7 @@ from core.database import collection, save_case
 from core.lambda_client import lambda_client
 from helpers.solve_captcha import solve_captcha
 from helpers.requests import safe_get, safe_post
+from helpers.orders import order_pdf_s3_key, stable_order_doc_id
 
 load_dotenv()
 
@@ -486,14 +487,19 @@ def fetch_submit_info(case_data: CaseRequest):
         result["s3_prefix"] = case_json_s3_path
 
         orders = []
+        seen_doc_ids = set()
         if order_html:
             order_soup = BeautifulSoup(order_html, "html.parser")
             links = order_soup.find_all("a", href=True)
-            for idx, a in enumerate(links, start=1):
+            for a in links:
                 order_date = clean_text(a.text)
                 final_pdf_url = a["href"]
-                order_number = str(idx)
-                s3_key = f"{orders_prefix}order-{order_number.zfill(3)}.pdf"
+                source_ref = final_pdf_url.split("?")[0]
+                doc_id = stable_order_doc_id(source_ref)
+                if doc_id in seen_doc_ids:
+                    continue
+                seen_doc_ids.add(doc_id)
+                s3_key = order_pdf_s3_key(orders_prefix, order_date, source_ref)
                 try:
                     s3_client.head_object(Bucket=BUCKET_NAME, Key=s3_key)
                     s3_url = f"https://{BUCKET_NAME}.s3.{REGION_NAME}.amazonaws.com/{s3_key}"
@@ -516,7 +522,7 @@ def fetch_submit_info(case_data: CaseRequest):
                     else:
                         s3_url = None
                 orders.append({
-                    "order_number": order_number,
+                    "order_number": str(len(orders) + 1),
                     "order_date": order_date,
                     "order_link": s3_url
                 })

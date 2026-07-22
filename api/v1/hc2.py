@@ -15,6 +15,7 @@ from core.s3_client import s3_client
 from helpers.solve_captcha import solve_captcha
 from core.lambda_client import lambda_client
 from helpers.requests import safe_get,safe_post
+from helpers.orders import hc_source_ref, order_pdf_s3_key, stable_order_doc_id
 import os
 import html
 load_dotenv()
@@ -205,6 +206,8 @@ def extract_and_upload_orders(soup, s3_client, session, BUCKET_NAME, REGION_NAME
     if not table:
         return orders
 
+    orders_prefix = build_case_base_path(metadata) + "orders/"
+    seen_doc_ids = set()
     rows = table.find_all("tr")[1:]
     for row in rows:
         cols = row.find_all("td")
@@ -218,9 +221,12 @@ def extract_and_upload_orders(soup, s3_client, session, BUCKET_NAME, REGION_NAME
             continue
 
         final_pdf_url = BASE_URL + link_tag["href"]
-        
-        orders_prefix = build_case_base_path(metadata) + "orders/"
-        s3_key = f"{orders_prefix}order-{order_number.zfill(3)}.pdf"
+        source_ref = hc_source_ref(link_tag["href"])
+        doc_id = stable_order_doc_id(source_ref)
+        if doc_id in seen_doc_ids:
+            continue
+        seen_doc_ids.add(doc_id)
+        s3_key = order_pdf_s3_key(orders_prefix, order_date, source_ref)
         try:
             s3_client.head_object(Bucket=BUCKET_NAME, Key=s3_key)
             s3_url = f"https://{BUCKET_NAME}.s3.{REGION_NAME}.amazonaws.com/{s3_key}"
@@ -558,13 +564,7 @@ def fetch_submit_hc_info(case_data: CaseRequestBulkIngest):
     query = case_data.dict()
     ac_query = {
             "courtType": "highcourt",
-            "cino": query.get("cino"),
-            "rgyear": query.get("rgyear"),
-            "court_code": query.get("court_code"),
-            "state_code": query.get("state_code"),
-            "dist_code": query.get("dist_code"),
-            "court_complex_code": query.get("court_complex_code"),
-            "case_reg_no" : query.get("case_no")
+            "cino": query.get("cino")
         }
    
     existing_case = collection.find_one(ac_query)

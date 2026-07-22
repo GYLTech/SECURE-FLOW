@@ -11,11 +11,15 @@ collection = db["casedetails"]
 
 
 APPEND_ONLY_ARRAYS = {
-    "orders": ("order_number", "order_date"),  
-    "case_history": (),                        
-    "case_transfer": (),                
+    "case_history": (),
+    "case_transfer": (),
 }
-_MERGE_PROJECTION = {field: 1 for field in APPEND_ONLY_ARRAYS}
+
+REPLACE_ARRAYS = ("orders",)
+
+_MERGE_PROJECTION = {
+    field: 1 for field in (*APPEND_ONLY_ARRAYS, *REPLACE_ARRAYS)
+}
 
 def _item_key(item, key_fields):
     """Return a hashable identity for a list item used to detect duplicates."""
@@ -28,6 +32,14 @@ def _item_key(item, key_fields):
 def _merge_append_only(existing_doc, result):
     if not existing_doc:
         return result
+
+    for field in REPLACE_ARRAYS:
+        new_items = result.get(field)
+        if isinstance(new_items, list) and not new_items:
+            old_items = existing_doc.get(field)
+            if isinstance(old_items, list) and old_items:
+                result[field] = old_items
+
     for field, key_fields in APPEND_ONLY_ARRAYS.items():
         new_items = result.get(field)
         if not isinstance(new_items, list):

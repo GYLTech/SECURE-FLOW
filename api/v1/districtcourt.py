@@ -16,6 +16,7 @@ from core.s3_client import s3_client
 from core.lambda_client import lambda_client
 from helpers.solve_captcha import solve_captcha
 from helpers.requests import safe_get
+from helpers.orders import order_pdf_s3_key, stable_order_doc_id
 import os
 from http.client import RemoteDisconnected
 load_dotenv()
@@ -284,6 +285,7 @@ def fetch_and_store_orders(
 ):
     orders_prefix = build_case_base_path(metadata) + "orders/"
     orders = []
+    seen_doc_ids = set()
     order_table = soup.find("table", {"class": table_class})
 
     if not order_table:
@@ -323,6 +325,11 @@ def fetch_and_store_orders(
         if len(values) < 4:
             continue
 
+        doc_id = stable_order_doc_id(values[3])
+        if doc_id in seen_doc_ids:
+            continue
+        seen_doc_ids.add(doc_id)
+
         order_payload = {
             "normal_v": values[0],
             "case_val": values[1],
@@ -346,7 +353,7 @@ def fetch_and_store_orders(
             continue
 
         final_pdf_url = f"{pdf_base_url}{pdf_path}"
-        s3_key = f"{orders_prefix}order-{order_number.zfill(3)}.pdf"
+        s3_key = order_pdf_s3_key(orders_prefix, order_date, values[3])
 
         try:
             s3_client.head_object(Bucket=bucket_name, Key=s3_key)
@@ -659,13 +666,7 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
 
         ac_query = {
             "courtType": "distcourts",
-            "cino": query.get("cino"),
-            "rgyear": query.get("rgyear"),
-            "court_code": query.get("court_code"),
-            "case_type": query.get("case_type"),
-            "state_code": query.get("state_code"),
-            "dist_code": query.get("dist_code"),
-            "court_complex_code": query.get("court_complex_code")
+            "cino": query.get("cino")
         }
 
         existing_case = collection.find_one(ac_query)
