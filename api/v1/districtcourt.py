@@ -1,3 +1,4 @@
+import base64
 import json
 import random
 import time
@@ -12,11 +13,17 @@ from typing import List, Optional
 from dotenv import load_dotenv
 from core.database import collection, save_case
 from core.s3_client import s3_client
+from core.lambda_client import lambda_client
+from helpers.solve_captcha import solve_captcha
+from helpers.requests import safe_get
 import os
 from http.client import RemoteDisconnected
 load_dotenv()
 REGION_NAME = os.getenv("REGION_NAME")
 app = APIRouter()
+MAX_RETRIES = 5
+BASE_URL = "https://services.ecourts.gov.in/ecourtindia_v6/"
+CAPTCHA_URL = BASE_URL + "vendor/securimage/securimage_show.php"
 
 class CaseRequest(BaseModel):
     case_type: str
@@ -517,27 +524,79 @@ def fetch_submit_info(case_data: CaseRequest):
         session.close()
 
 
+def get_app_token(session):
+    response = safe_get(session, BASE_URL + "?p=casestatus/index")
+    match = re.search(r'name="app_token"[^>]*value="([^"]+)"', response.text)
+    if not match:
+        match = re.search(r'app_token=([0-9a-f]{64})', response.text)
+    return match.group(1) if match else ""
+
+
 @app.post("/dc/bulk_q/partyname")
 def fetch_submit_info(case_data: CaseRequestBulk):
     session = requests.Session()
     case_info = {}
 
     try:
-        payload = {
-            'ajax_req': 'true',
-            'petres_name': case_data.petres_name,
-            'rgyearP': case_data.rgyearP,
-            'case_status': case_data.case_status,
-            'state_code': case_data.state_code,
-            'dist_code': case_data.dist_code,
-            'court_complex_code': case_data.court_complex_code,
-            'est_code': case_data.est_code,
-        }
+        app_token = get_app_token(session)
+        html_content = None
 
-        search_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=casestatus/submitPartyName"
-        response = safe_post(session, search_url, payload)
+        for attempt in range(1, MAX_RETRIES + 1):
+            captcha_response = safe_get(
+                session, f"{CAPTCHA_URL}?{random.random()}")
+            image_base64 = base64.b64encode(
+                captcha_response.content
+            ).decode("utf-8")
+            captcha_text = solve_captcha(
+                lambda_client=lambda_client, image_base64=image_base64, frm="hc")
+            if not captcha_text:
+                continue
 
-        html_content = response.json().get("party_data", "")
+            payload = {
+                'petres_name': case_data.petres_name,
+                'rgyearP': case_data.rgyearP,
+                'case_status': case_data.case_status,
+                'fcaptcha_code': str(captcha_text).strip(),
+                'state_code': case_data.state_code,
+                'dist_code': case_data.dist_code,
+                'court_complex_code': case_data.court_complex_code,
+                'est_code': case_data.est_code if case_data.est_code else 'null',
+                'ajax_req': 'true',
+                'app_token': app_token,
+            }
+
+            search_url = BASE_URL + "?p=casestatus/submitPartyName"
+            response = safe_post(session, search_url, payload)
+
+            try:
+                response_json = response.json()
+            except Exception:
+                print(f"⚠️ Non-JSON response (attempt {attempt})")
+                continue
+
+            app_token = response_json.get("app_token", app_token)
+
+            error_msg = str(response_json.get("errormsg", ""))
+            if "captcha" in error_msg.lower():
+                print(f"⚠️ Invalid captcha (attempt {attempt})")
+                continue
+
+            if "session" in error_msg.lower() or "expire" in error_msg.lower():
+                print(f"⚠️ Session expired, refreshing token (attempt {attempt})")
+                app_token = get_app_token(session)
+                continue
+
+            html_content = response_json.get("party_data", "")
+            if not html_content:
+                print(f"⚠️ Empty party_data (attempt {attempt})")
+                continue
+            break
+
+        if not html_content:
+            return JSONResponse(
+                content={"error": "Unable to get response from Ecourts at this moment"},
+                status_code=404
+            )
 
         if "Record not found" in html_content:
             return JSONResponse(content={"error": "Invalid case details"}, status_code=404)
