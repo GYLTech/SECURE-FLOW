@@ -105,6 +105,15 @@ def clean_text(text):
     return re.sub(r"\s+", " ", text.strip())
 
 
+def status_value(case_status, *labels):
+    """First non-placeholder value among the given Case Status labels."""
+    for label in labels:
+        value = clean_text(case_status.get(label, "") or "")
+        if value and value not in ("--", "-", "null"):
+            return value
+    return ""
+
+
 def extract_party_details(soup, class_name):
     extracted_data = []
     elements = soup.find_all("span", class_=class_name)
@@ -276,7 +285,10 @@ def parse_case_history(html, payload, second_payload,session):
         "State",
         "District",
         "Not Before Me",
-        "Stage of Case"
+        "Stage of Case",
+        "Next Date",
+        "Next Hearing Date",
+        "Tentative Date"
     ])
 
     petitioner_and_advocate = extract_party_details(
@@ -303,8 +315,14 @@ def parse_case_history(html, payload, second_payload,session):
         "FilingNumber": case_details.get("Filing Number", ""),
         "RegistrationNumber": case_details.get("Registration Number", ""),
         "CNRNumber": second_payload.get("cino"),
-        "FirstHearingDate": case_status.get("First Hearing Date", ""),
-        "CaseStatus": case_status.get("Stage of Case", ""),
+        "FirstHearingDate": status_value(case_status, "First Hearing Date"),
+        # Disposed HC pages have no "Stage of Case" row and no history table —
+        # disposal lives in "Case Status" / "Decision Date", so map those too
+        # or disposed cases look active-with-no-history forever.
+        "CaseStatus": status_value(case_status, "Stage of Case", "Case Status"),
+        "DecisionDate": status_value(case_status, "Decision Date"),
+        "NatureofDisposal": status_value(case_status, "Nature of Disposal"),
+        "NextHearingDate": status_value(case_status, "Next Date", "Next Hearing Date", "Tentative Date"),
         "CourtNumberandJudge": case_status.get("Coram", ""),
         "petitioner_and_advocate": petitioner_and_advocate,
         "respondent_and_advocate": respondent_and_advocate,
@@ -606,10 +624,24 @@ def fetch_submit_hc_info(case_data: CaseRequestBulkIngest):
 
         result = parse_case_history(
                 second_resp.text, payload, second_payload, session=session)
-        
+
+        print(
+            f"[hc2/bulk_i] cino={case_data.cino} status={second_resp.status_code} "
+            f"html_len={len(second_resp.text)} history_rows={len(result.get('case_history') or [])} "
+            f"reg_no={result.get('RegistrationNumber')!r}"
+        )
+
+        # A page with no history AND no registration number means HC services
+        # blocked/failed the request — don't return an empty shell as success.
+        if not result.get("case_history") and not result.get("RegistrationNumber"):
+            return JSONResponse(
+                content={"error": "HC services returned a page with no case data"},
+                status_code=502
+            )
+
         result["_id"] = save_case(result, existing_case_id)
         return JSONResponse(content=result, status_code=200)
-    
+
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)
     finally:

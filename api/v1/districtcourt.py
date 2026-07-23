@@ -33,8 +33,6 @@ ECOURTS_AJAX_HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
     "Origin": "https://services.ecourts.gov.in",
     "Referer": "https://services.ecourts.gov.in/",
-    # eCourts rejects AJAX POSTs missing this header ("Invalid Request") —
-    # verified 2026-07-23; it is set by ajaxCall() in their js/components.js
     "abc": "xyz"
 }
 
@@ -739,14 +737,34 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
         if case_info.get("est_code") is not None:
             second_payload["est_code"] = str(case_info["est_code"])
 
+        # viewHistory rejects tokenless requests — fetch app_token + ajax
+        # headers the same way /getcaseInfo does before hitting it.
+        ajax_headers = get_ajax_headers(session)
+        second_payload["app_token"] = get_app_token(session, headers=ajax_headers)
+
         second_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=home/viewHistory"
-        second_response = safe_post(session, second_url, second_payload)
+        second_response = safe_post(session, second_url, second_payload, headers=ajax_headers)
 
         if second_response.status_code != 200:
             return JSONResponse(content={"error": "Failed request"}, status_code=500)
 
         case_data = second_response.json()
-        soup = BeautifulSoup(case_data.get("data_list", ""), "html.parser")
+        data_list = case_data.get("data_list", "")
+        errormsg = str(case_data.get("errormsg", "") or "")
+        print(
+            f"[dc/bulk_i] cino={single_case.cino} status={second_response.status_code} "
+            f"data_list_len={len(data_list)} errormsg={errormsg[:150]!r}"
+        )
+
+        if not data_list.strip():
+            # Don't echo back an empty shell that looks like a success —
+            # surface why eCourts gave us nothing.
+            return JSONResponse(
+                content={"error": errormsg or "eCourts returned empty data_list"},
+                status_code=502
+            )
+
+        soup = BeautifulSoup(data_list, "html.parser")
 
         case_status = extract_table_data(soup, "table case_status_table table-bordered")
         case_details = extract_table_data(soup, "table case_details_table table-bordered")
@@ -756,6 +774,11 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
         acts_and_sections = extract_acts_and_sections(soup)
         case_history = {"case_history": extract_case_history(soup)}
         case_transfer = {"case_transfer": extract_case_transfer(soup)}
+
+        print(
+            f"[dc/bulk_i] cino={single_case.cino} history_rows={len(case_history['case_history'])} "
+            f"sample_dates={[h.get('hearingDate') for h in case_history['case_history'][:3]]}"
+        )
 
         metadata = {
             **case_info,

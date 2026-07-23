@@ -480,6 +480,13 @@ def fetch_submit_info(case_data: CaseRequest):
                         "lawyerRemark": cols[7] if len(cols) > 7 else "null"
                     })
         result["case_history"] = case_history
+
+        print(
+            f"[sci/getcaseInfo] case_no={case_data.case_no}/{case_data.rgyear} "
+            f"listing_html_len={len(listing_html or '')} history_rows={len(case_history)} "
+            f"sample_dates={[h.get('hearingDate') for h in case_history[:3]]}"
+        )
+
         orders_prefix = build_case_base_path(result) + "orders/"
         case_json_s3_path = upload_case_json_to_s3(
         s3_client,"dl-shared-gyl-vidilekh",result
