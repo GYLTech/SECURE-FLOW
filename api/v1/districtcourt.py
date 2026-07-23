@@ -26,6 +26,31 @@ MAX_RETRIES = 5
 BASE_URL = "https://services.ecourts.gov.in/ecourtindia_v6/"
 CAPTCHA_URL = BASE_URL + "vendor/securimage/securimage_show.php"
 
+DEFAULT_DELIMETER = "prdm120346"
+ECOURTS_AJAX_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "X-Requested-With": "XMLHttpRequest",
+    "Origin": "https://services.ecourts.gov.in",
+    "Referer": "https://services.ecourts.gov.in/",
+    # eCourts rejects AJAX POSTs missing this header ("Invalid Request") —
+    # verified 2026-07-23; it is set by ajaxCall() in their js/components.js
+    "abc": "xyz"
+}
+
+
+def get_ajax_headers(session):
+    headers = dict(ECOURTS_AJAX_HEADERS)
+    try:
+        js_response = safe_get(session, BASE_URL + "js/components.js")
+        match = re.search(r'var\s+delimeter\s*=\s*"([^"]+)"', js_response.text)
+        if match:
+            headers["delimeter"] = match.group(1)
+    except Exception:
+        pass
+    headers.setdefault("delimeter", DEFAULT_DELIMETER)
+    return headers
+
 class CaseRequest(BaseModel):
     case_type: str
     case_reg_no: str
@@ -94,7 +119,11 @@ def upload_case_json_to_s3(
 
     return f"s3://{bucket_name}/{key}"
 
-def safe_post(session, url, data, max_retries=3):
+def safe_post(session, url, data, headers=None, max_retries=3):
+    merged_headers = {"Connection": "close"}
+    if headers:
+        merged_headers.update(headers)
+
     for attempt in range(max_retries):
         try:
             time.sleep(random.uniform(1.2, 2.0))
@@ -103,7 +132,7 @@ def safe_post(session, url, data, max_retries=3):
                 url,
                 data=data,
                 timeout=(10, 120),
-                headers={"Connection": "close"}
+                headers=merged_headers
             )
             return response
 
@@ -531,8 +560,8 @@ def fetch_submit_info(case_data: CaseRequest):
         session.close()
 
 
-def get_app_token(session):
-    response = safe_get(session, BASE_URL + "?p=casestatus/index")
+def get_app_token(session, headers=None):
+    response = safe_get(session, BASE_URL + "?p=casestatus/index", headers=headers)
     match = re.search(r'name="app_token"[^>]*value="([^"]+)"', response.text)
     if not match:
         match = re.search(r'app_token=([0-9a-f]{64})', response.text)
@@ -545,12 +574,14 @@ def fetch_submit_info(case_data: CaseRequestBulk):
     case_info = {}
 
     try:
-        app_token = get_app_token(session)
+        ajax_headers = get_ajax_headers(session)
+        app_token = get_app_token(session, headers=ajax_headers)
         html_content = None
 
         for attempt in range(1, MAX_RETRIES + 1):
             captcha_response = safe_get(
-                session, f"{CAPTCHA_URL}?{random.random()}")
+                session, f"{CAPTCHA_URL}?{random.random()}",
+                headers=ajax_headers)
             image_base64 = base64.b64encode(
                 captcha_response.content
             ).decode("utf-8")
@@ -573,7 +604,7 @@ def fetch_submit_info(case_data: CaseRequestBulk):
             }
 
             search_url = BASE_URL + "?p=casestatus/submitPartyName"
-            response = safe_post(session, search_url, payload)
+            response = safe_post(session, search_url, payload, headers=ajax_headers)
 
             try:
                 response_json = response.json()
@@ -581,16 +612,19 @@ def fetch_submit_info(case_data: CaseRequestBulk):
                 print(f"⚠️ Non-JSON response (attempt {attempt})")
                 continue
 
-            app_token = response_json.get("app_token", app_token)
+            new_token = response_json.get("app_token") or ""
+            if new_token:
+                app_token = new_token
 
             error_msg = str(response_json.get("errormsg", ""))
             if "captcha" in error_msg.lower():
                 print(f"⚠️ Invalid captcha (attempt {attempt})")
                 continue
 
-            if "session" in error_msg.lower() or "expire" in error_msg.lower():
-                print(f"⚠️ Session expired, refreshing token (attempt {attempt})")
-                app_token = get_app_token(session)
+            if not new_token or "invalid request" in error_msg.lower() \
+                    or "session" in error_msg.lower() or "expire" in error_msg.lower():
+                print(f"⚠️ Token/session rejected, refreshing token (attempt {attempt})")
+                app_token = get_app_token(session, headers=ajax_headers)
                 continue
 
             html_content = response_json.get("party_data", "")
