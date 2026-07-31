@@ -603,6 +603,7 @@ def fetch_submit_info(case_data: CaseRequest):
                 'search_case_no': case_data.case_reg_no,
             },
             "case_data",
+            captcha_field="case_captcha_code",
         )
 
         if not html_content:
@@ -736,11 +737,12 @@ def get_app_token(session, force_refresh=False):
     return remember_app_token(session, match.group(1) if match else "")
 
 
-def submit_search_with_captcha(session, url, payload, result_key):
+def submit_search_with_captcha(session, url, payload, result_key,
+                               captcha_field="fcaptcha_code"):
     app_token = get_app_token(session)
 
     for attempt in range(1, MAX_RETRIES + 1):
-        captcha_response = safe_get(session, f"{CAPTCHA_URL}?{random.random()}")
+        captcha_response = safe_get(session, f"{CAPTCHA_URL}? {random.random()}")
         image_base64 = base64.b64encode(captcha_response.content).decode("utf-8")
         captcha_text = solve_captcha(
             lambda_client=lambda_client, image_base64=image_base64, frm="hc")
@@ -749,7 +751,7 @@ def submit_search_with_captcha(session, url, payload, result_key):
             continue
 
         body = dict(payload)
-        body["fcaptcha_code"] = str(captcha_text).strip()
+        body[captcha_field] = str(captcha_text).strip()
         body["ajax_req"] = "true"
         body["app_token"] = app_token
 
