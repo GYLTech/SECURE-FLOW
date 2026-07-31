@@ -1,6 +1,7 @@
 import base64
 import json
 import random
+import threading
 import time
 import requests
 from bs4 import BeautifulSoup
@@ -17,37 +18,159 @@ from core.lambda_client import lambda_client
 from helpers.solve_captcha import solve_captcha
 from helpers.requests import safe_get
 from helpers.orders import order_pdf_s3_key, stable_order_doc_id
+from helpers.ecourts_session import (
+    BASE_URL,
+    EcourtsBlockedError,
+    EcourtsGateError,
+    breaker,
+    gate_rejected,
+    invalidate_gate,
+    looks_blocked,
+    resolve_gate,
+)
 import os
 from http.client import RemoteDisconnected
 load_dotenv()
 REGION_NAME = os.getenv("REGION_NAME")
 app = APIRouter()
 MAX_RETRIES = 5
-BASE_URL = "https://services.ecourts.gov.in/ecourtindia_v6/"
 CAPTCHA_URL = BASE_URL + "vendor/securimage/securimage_show.php"
 
-DEFAULT_DELIMETER = "prdm120346"
-ECOURTS_AJAX_HEADERS = {
+BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    "X-Requested-With": "XMLHttpRequest",
-    "Origin": "https://services.ecourts.gov.in",
-    "Referer": "https://services.ecourts.gov.in/",
-    "abc": "xyz"
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
+APP_TOKEN_RE = re.compile(r'name="app_token"[^>]*value="([^"]+)"')
 
-def get_ajax_headers(session):
-    headers = dict(ECOURTS_AJAX_HEADERS)
+ECOURTS_PROXY = os.getenv("ECOURTS_PROXY")
+POOL_SIZE = int(os.getenv("ECOURTS_POOL_SIZE", "4"))
+BLOCK_RETRIES = 4
+
+SESSION_MAX_AGE_SECONDS = int(os.getenv("ECOURTS_SESSION_MAX_AGE", "600"))
+SESSION_MAX_USES = int(os.getenv("ECOURTS_SESSION_MAX_USES", "25"))
+
+_pool = []
+_pool_lock = threading.Lock()
+_ecourts_gate_slot = threading.Semaphore(POOL_SIZE)
+
+
+def ecourts_gate_headers(session, force_refresh=False):
+    """Validated gate headers. The delimeter is global and probe-checked once
+    per process, not scraped blind per session."""
+    return resolve_gate(session, getattr(session, "_app_token", ""), force_refresh)
+
+
+def remember_app_token(session, token):
+    """eCourts rotates app_token on *every* response. Losing a rotation
+    poisons the session for its next request, so persist each one."""
+    if token:
+        session._app_token = token
+    return getattr(session, "_app_token", "")
+
+
+def session_expired(session):
+    if not getattr(session, "_gate_ready", False):
+        return True
+    age = time.monotonic() - getattr(session, "_created_at", 0)
+    if age > SESSION_MAX_AGE_SECONDS:
+        return True
+    return getattr(session, "_uses", 0) >= SESSION_MAX_USES
+
+
+def new_ecourts_session():
+    session = requests.Session()
+    session.headers.update(BROWSER_HEADERS)
+    if ECOURTS_PROXY:
+        session.proxies.update({"http": ECOURTS_PROXY, "https": ECOURTS_PROXY})
+
+    session._created_at = time.monotonic()
+    session._uses = 0
+    session._gate_ready = False
+    session._search_validated = False
+
+    response = safe_get(session, BASE_URL + "?p=casestatus/index")
+    if looks_blocked(response):
+        session.close()
+        breaker.record_block()
+        raise EcourtsBlockedError(
+            "eCourts is refusing requests from this IP (HTTP 405 throttle "
+            "stub). Retry later, or route through another IP via ECOURTS_PROXY."
+        )
+
+    match = APP_TOKEN_RE.search(response.text)
+    remember_app_token(session, match.group(1) if match else "")
+    ecourts_gate_headers(session)
+    session._gate_ready = True
+    breaker.record_success()
+    return session
+
+
+def rewarm_session(session):
+    response = safe_get(session, BASE_URL + "?p=casestatus/index")
+    if looks_blocked(response):
+        breaker.record_block()
+        raise EcourtsBlockedError(
+            "eCourts is refusing requests from this IP (HTTP 405 throttle "
+            "stub). Retry later, or route through another IP via ECOURTS_PROXY."
+        )
+    match = APP_TOKEN_RE.search(response.text)
+    remember_app_token(session, match.group(1) if match else "")
+    invalidate_gate()
+    ecourts_gate_headers(session, force_refresh=True)
+    session._search_validated = False
+    return session._app_token
+
+
+def _acquire_session():
+    with _pool_lock:
+        while _pool:
+            session = _pool.pop()
+            if not session_expired(session):
+                session._uses = getattr(session, "_uses", 0) + 1
+                return session
+            session.close()
+
+    last_error = None
+    for attempt in range(1, BLOCK_RETRIES + 1):
+        try:
+            session = new_ecourts_session()
+            session._uses = 1
+            return session
+        except EcourtsBlockedError as exc:
+            last_error = exc
+            breaker.check()
+            print(f"[warn] eCourts throttling this IP (attempt {attempt})")
+            time.sleep(min(2 ** attempt, 20))
+    raise last_error
+
+
+def _release_session(session, discard=False):
+    if discard or session_expired(session):
+        session.close()
+        return
+    with _pool_lock:
+        if len(_pool) < POOL_SIZE:
+            _pool.append(session)
+            return
+    session.close()
+
+
+def acquire_ecourts_session():
+    breaker.check()
+    _ecourts_gate_slot.acquire()
     try:
-        js_response = safe_get(session, BASE_URL + "js/components.js")
-        match = re.search(r'var\s+delimeter\s*=\s*"([^"]+)"', js_response.text)
-        if match:
-            headers["delimeter"] = match.group(1)
-    except Exception:
-        pass
-    headers.setdefault("delimeter", DEFAULT_DELIMETER)
-    return headers
+        return _acquire_session()
+    except BaseException:
+        _ecourts_gate_slot.release()
+        raise
+
+
+def release_ecourts_session(session, discard=False):
+    try:
+        _release_session(session, discard)
+    finally:
+        _ecourts_gate_slot.release()
 
 class CaseRequest(BaseModel):
     case_type: str
@@ -118,13 +241,17 @@ def upload_case_json_to_s3(
     return f"s3://{bucket_name}/{key}"
 
 def safe_post(session, url, data, headers=None, max_retries=3):
-    merged_headers = {"Connection": "close"}
-    if headers:
-        merged_headers.update(headers)
-
     for attempt in range(max_retries):
         try:
             time.sleep(random.uniform(1.2, 2.0))
+
+            merged_headers = {"Connection": "close"}
+            merged_headers.update(ecourts_gate_headers(session))
+            if headers:
+                merged_headers.update(headers)
+
+            if isinstance(data, dict) and "app_token" in data:
+                data["app_token"] = getattr(session, "_app_token", "") or data["app_token"]
 
             response = session.post(
                 url,
@@ -132,18 +259,38 @@ def safe_post(session, url, data, headers=None, max_retries=3):
                 timeout=(10, 120),
                 headers=merged_headers
             )
+
+            if looks_blocked(response):
+                breaker.record_block()
+                raise EcourtsBlockedError(
+                    "eCourts is refusing requests from this IP (HTTP 405 "
+                    "throttle stub). Retry later, or route through another IP "
+                    "via ECOURTS_PROXY."
+                )
+
+            try:
+                remember_app_token(session, response.json().get("app_token"))
+            except Exception:
+                pass
+
+            if gate_rejected(response) and attempt < max_retries - 1:
+                print(f"[warn] Gate rejected, re-warming (attempt {attempt+1})")
+                token = rewarm_session(session)
+                if isinstance(data, dict) and "app_token" in data:
+                    data["app_token"] = token
+                continue
+
+            breaker.record_success()
             return response
 
         except (requests.exceptions.ConnectionError, RemoteDisconnected) as e:
-            print(f"⚠️ Server disconnected (attempt {attempt+1})")
-
+            print(f"[warn] Server disconnected (attempt {attempt+1})")
             session.close()
-            session = requests.Session()
 
         except requests.exceptions.Timeout:
-            print(f"⚠️ Timeout (attempt {attempt+1})")
+            print(f"[warn] Timeout (attempt {attempt+1})")
 
-    raise Exception("❌ eCourts viewHistory failed after retries")
+    raise Exception("[error] eCourts request failed after retries")
 
 
 def sanitize_keys(data):
@@ -319,7 +466,7 @@ def fetch_and_store_orders(
         return orders
 
     rows = order_table.find_all("tr")[1:]
-    app_token = case_details.get("app_token", "")
+    remember_app_token(session, case_details.get("app_token", ""))
 
     for row in rows:
         cols = row.find_all("td")
@@ -364,14 +511,13 @@ def fetch_and_store_orders(
             "filename": values[3],
             "appFlag": values[4] if len(values) > 4 else "",
             "ajax_req": "true",
-            "app_token": app_token
+            "app_token": getattr(session, "_app_token", "")
         }
 
         order_response = safe_post(session, pdf_endpoint, order_payload)
 
         try:
             response_json = order_response.json()
-            app_token = response_json.get("app_token", app_token)
             pdf_path = response_json.get("order", "").replace("\\", "")
         except Exception:
             continue
@@ -433,27 +579,37 @@ def fetch_submit_info(case_data: CaseRequest):
         return JSONResponse(content=jsonable_encoder(existing_case))
 
     existing_case_id = existing_case["_id"] if existing_case else None
-    
-    session = requests.Session()
-    case_info = {}
 
     try:
-        payload = {
-            'ajax_req': 'true',
-            'case_type': case_data.case_type,
-            'case_no': case_data.case_reg_no,
-            'rgyear': case_data.rgyear,
-            'state_code': case_data.state_code,
-            'dist_code': case_data.dist_code,
-            'court_complex_code': case_data.court_complex_code,
-            'est_code': case_data.est_code,
-            'search_case_no': case_data.case_reg_no,
-        }
+        session = acquire_ecourts_session()
+    except EcourtsBlockedError as exc:
+        return JSONResponse(content={"error": str(exc)}, status_code=503)
 
-        search_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=casestatus/submitCaseNo"
-        response = safe_post(session, search_url, payload)
+    case_info = {}
+    discard = False
 
-        html_content = response.json().get("case_data", "")
+    try:
+        html_content, search_app_token = submit_search_with_captcha(
+            session,
+            BASE_URL + "?p=casestatus/submitCaseNo",
+            {
+                'case_type': case_data.case_type,
+                'case_no': case_data.case_reg_no,
+                'rgyear': case_data.rgyear,
+                'state_code': case_data.state_code,
+                'dist_code': case_data.dist_code,
+                'court_complex_code': case_data.court_complex_code,
+                'est_code': case_data.est_code if case_data.est_code else 'null',
+                'search_case_no': case_data.case_reg_no,
+            },
+            "case_data",
+        )
+
+        if not html_content:
+            return JSONResponse(
+                content={"error": "Unable to get response from Ecourts at this moment"},
+                status_code=404
+            )
 
         if "Record not found" in html_content:
             return JSONResponse(content={"error": "Invalid case details"}, status_code=404)
@@ -484,7 +640,7 @@ def fetch_submit_info(case_data: CaseRequest):
                 }
 
                 second_payload = {
-                    "app_token": response.json().get("app_token", ""),
+                    "app_token": search_app_token,
                     "court_code": case_info["court_code"],
                     "state_code": case_info["state_code"],
                     "dist_code": case_info["dist_code"],
@@ -554,82 +710,114 @@ def fetch_submit_info(case_data: CaseRequest):
 
         return JSONResponse(content={"error": "Case details not found"}, status_code=403)
 
+    except (EcourtsBlockedError, EcourtsGateError) as exc:
+        discard = True
+        return JSONResponse(content={"error": str(exc)}, status_code=503)
+
     finally:
-        session.close()
+        release_ecourts_session(session, discard)
 
 
-def get_app_token(session, headers=None):
-    response = safe_get(session, BASE_URL + "?p=casestatus/index", headers=headers)
-    match = re.search(r'name="app_token"[^>]*value="([^"]+)"', response.text)
+def get_app_token(session, force_refresh=False):
+    cached = getattr(session, "_app_token", "")
+    if cached and not force_refresh:
+        return cached
+
+    response = safe_get(session, BASE_URL + "?p=casestatus/index")
+    if looks_blocked(response):
+        breaker.record_block()
+        raise EcourtsBlockedError(
+            "eCourts is refusing requests from this IP while refreshing the "
+            "app_token. Retry later, or route through another IP via ECOURTS_PROXY."
+        )
+    match = APP_TOKEN_RE.search(response.text)
     if not match:
         match = re.search(r'app_token=([0-9a-f]{64})', response.text)
-    return match.group(1) if match else ""
+    return remember_app_token(session, match.group(1) if match else "")
+
+
+def submit_search_with_captcha(session, url, payload, result_key):
+    app_token = get_app_token(session)
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        captcha_response = safe_get(session, f"{CAPTCHA_URL}?{random.random()}")
+        image_base64 = base64.b64encode(captcha_response.content).decode("utf-8")
+        captcha_text = solve_captcha(
+            lambda_client=lambda_client, image_base64=image_base64, frm="hc")
+        if not captcha_text:
+            print(f"[warn] Captcha solver returned nothing (attempt {attempt})")
+            continue
+
+        body = dict(payload)
+        body["fcaptcha_code"] = str(captcha_text).strip()
+        body["ajax_req"] = "true"
+        body["app_token"] = app_token
+
+        response = safe_post(session, url, body)
+
+        try:
+            response_json = response.json()
+        except Exception:
+            print(f"[warn] Non-JSON response (attempt {attempt})")
+            continue
+
+        app_token = remember_app_token(session, response_json.get("app_token") or "")
+
+        error_msg = str(response_json.get("errormsg", "") or "").lower()
+
+        if "invalid request" in error_msg:
+            print(f"[warn] Gate rejected the request (attempt {attempt})")
+            invalidate_gate()
+            ecourts_gate_headers(session, force_refresh=True)
+            app_token = get_app_token(session, force_refresh=True)
+            continue
+
+        if "captcha" in error_msg:
+            print(f"[warn] Invalid captcha (attempt {attempt})")
+            continue
+
+        if "session" in error_msg or "expire" in error_msg:
+            print(f"[warn] Session expired, refreshing token (attempt {attempt})")
+            app_token = get_app_token(session, force_refresh=True)
+            continue
+
+        html = response_json.get(result_key, "")
+        if not html:
+            print(f"[warn] Empty {result_key} (attempt {attempt})")
+            continue
+
+        session._search_validated = True
+        return html, app_token
+
+    return None, app_token
 
 
 @app.post("/dc/bulk_q/partyname")
 def fetch_submit_info(case_data: CaseRequestBulk):
-    session = requests.Session()
     case_info = {}
 
     try:
-        ajax_headers = get_ajax_headers(session)
-        app_token = get_app_token(session, headers=ajax_headers)
-        html_content = None
+        session = acquire_ecourts_session()
+    except EcourtsBlockedError as exc:
+        return JSONResponse(content={"error": str(exc)}, status_code=503)
 
-        for attempt in range(1, MAX_RETRIES + 1):
-            captcha_response = safe_get(
-                session, f"{CAPTCHA_URL}?{random.random()}",
-                headers=ajax_headers)
-            image_base64 = base64.b64encode(
-                captcha_response.content
-            ).decode("utf-8")
-            captcha_text = solve_captcha(
-                lambda_client=lambda_client, image_base64=image_base64, frm="hc")
-            if not captcha_text:
-                continue
+    discard = False
 
-            payload = {
+    try:
+        html_content, _ = submit_search_with_captcha(
+            session,
+            BASE_URL + "?p=casestatus/submitPartyName",
+            {
                 'petres_name': case_data.petres_name,
                 'rgyearP': case_data.rgyearP,
                 'case_status': case_data.case_status,
-                'fcaptcha_code': str(captcha_text).strip(),
                 'state_code': case_data.state_code,
                 'dist_code': case_data.dist_code,
                 'court_complex_code': case_data.court_complex_code,
                 'est_code': case_data.est_code if case_data.est_code else 'null',
-                'ajax_req': 'true',
-                'app_token': app_token,
-            }
-
-            search_url = BASE_URL + "?p=casestatus/submitPartyName"
-            response = safe_post(session, search_url, payload, headers=ajax_headers)
-
-            try:
-                response_json = response.json()
-            except Exception:
-                print(f"⚠️ Non-JSON response (attempt {attempt})")
-                continue
-
-            new_token = response_json.get("app_token") or ""
-            if new_token:
-                app_token = new_token
-
-            error_msg = str(response_json.get("errormsg", ""))
-            if "captcha" in error_msg.lower():
-                print(f"⚠️ Invalid captcha (attempt {attempt})")
-                continue
-
-            if not new_token or "invalid request" in error_msg.lower() \
-                    or "session" in error_msg.lower() or "expire" in error_msg.lower():
-                print(f"⚠️ Token/session rejected, refreshing token (attempt {attempt})")
-                app_token = get_app_token(session, headers=ajax_headers)
-                continue
-
-            html_content = response_json.get("party_data", "")
-            if not html_content:
-                print(f"⚠️ Empty party_data (attempt {attempt})")
-                continue
-            break
+            },
+            "party_data",
+        )
 
         if not html_content:
             return JSONResponse(
@@ -687,12 +875,54 @@ def fetch_submit_info(case_data: CaseRequestBulk):
 
         return JSONResponse(content={"data": results}, status_code=200)
 
+    except (EcourtsBlockedError, EcourtsGateError) as exc:
+        discard = True
+        return JSONResponse(content={"error": str(exc)}, status_code=503)
+
     finally:
-        session.close()
+        release_ecourts_session(session, discard)
+
+CNR_HISTORY_URL = BASE_URL + "?p=cnr_status/viewCNRHistory/"
+
+
+def fetch_history_by_cnr(session, cino):
+    """Pull case history straight from a CNR.
+
+    `home/viewHistory` needs prior search state in the PHP session, so calling
+    it on a freshly pooled session is a coin flip that mostly loses - that is
+    what produced the "Invalid Request" wall. The CNR endpoint takes the cino
+    on its own, needs no captcha, and returns the same markup under
+    `casetype_list`.
+    """
+    payload = {
+        "cino": str(cino),
+        "ajax_req": "true",
+        "app_token": getattr(session, "_app_token", ""),
+    }
+
+    response = safe_post(session, CNR_HISTORY_URL, payload)
+
+    if response.status_code != 200:
+        return "", f"CNR lookup returned HTTP {response.status_code}"
+
+    try:
+        body = response.json()
+    except Exception:
+        return "", "CNR lookup returned a non-JSON response"
+
+    html = body.get("casetype_list") or body.get("data_list") or ""
+    return html, str(body.get("errormsg", "") or "")
+
 
 @app.post("/dc/bulk_i/partyname")
 def fetch_submit_info(single_case: CaseRequestBulkIngest):
-    session = requests.Session()
+    try:
+        session = acquire_ecourts_session()
+    except EcourtsBlockedError as exc:
+        return JSONResponse(content={"error": str(exc)}, status_code=503)
+
+    discard = False
+
     try:
         query = single_case.dict()
 
@@ -721,46 +951,19 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
             "courtType": "distcourts"
         }
 
-        second_payload = {
-            "court_code": str(case_info.get("court_code", "")),
-            "state_code": str(case_info.get("state_code", "")),
-            "dist_code": str(case_info.get("dist_code", "")),
-            "court_complex_code": str(case_info.get("court_complex_code", "")),
-            "case_no": str(case_info.get("case_no", "")),
-            "cino": str(case_info.get("cino", "")),
-            "rgyear": str(case_info.get("rgyear", "")),
-            "search_flag": "CScaseNumber",
-            "search_by": "CScaseNumber",
-            "ajax_req": "true"
-        }
+        get_app_token(session)
 
-        if case_info.get("est_code") is not None:
-            second_payload["est_code"] = str(case_info["est_code"])
+        data_list, errormsg = fetch_history_by_cnr(session, case_info["cino"])
 
-        # viewHistory rejects tokenless requests — fetch app_token + ajax
-        # headers the same way /getcaseInfo does before hitting it.
-        ajax_headers = get_ajax_headers(session)
-        second_payload["app_token"] = get_app_token(session, headers=ajax_headers)
-
-        second_url = "https://services.ecourts.gov.in/ecourtindia_v6/?p=home/viewHistory"
-        second_response = safe_post(session, second_url, second_payload, headers=ajax_headers)
-
-        if second_response.status_code != 200:
-            return JSONResponse(content={"error": "Failed request"}, status_code=500)
-
-        case_data = second_response.json()
-        data_list = case_data.get("data_list", "")
-        errormsg = str(case_data.get("errormsg", "") or "")
         print(
-            f"[dc/bulk_i] cino={single_case.cino} status={second_response.status_code} "
-            f"data_list_len={len(data_list)} errormsg={errormsg[:150]!r}"
+            f"[dc/bulk_i] cino={single_case.cino} html_len={len(data_list)} "
+            f"errormsg={errormsg[:150]!r}"
         )
 
         if not data_list.strip():
-            # Don't echo back an empty shell that looks like a success —
-            # surface why eCourts gave us nothing.
+            discard = True
             return JSONResponse(
-                content={"error": errormsg or "eCourts returned empty data_list"},
+                content={"error": errormsg or "eCourts returned no case history for this CNR"},
                 status_code=502
             )
 
@@ -802,7 +1005,7 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
             soup,
             session,
             metadata,
-            case_data,
+            {"app_token": getattr(session, "_app_token", "")},
             s3_client,
             "dl-shared-gyl-vidilekh",
             REGION_NAME
@@ -819,5 +1022,9 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
 
         return JSONResponse(content=final_response, status_code=200)
 
+    except (EcourtsBlockedError, EcourtsGateError) as exc:
+        discard = True
+        return JSONResponse(content={"error": str(exc)}, status_code=503)
+
     finally:
-        session.close()
+        release_ecourts_session(session, discard)

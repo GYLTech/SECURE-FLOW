@@ -170,13 +170,125 @@ def extract_subordinate_court_info(soup):
     return details
 
 
+FULL_DATE_RE = re.compile(r"\b(\d{1,2})-(\d{1,2})-(\d{4})\b")
+PARTIAL_DATE_RE = re.compile(r"^(\d{1,2})(?:st|nd|rd|th)\s+([A-Za-z]*)\s*(\d{4})$")
+MONTHS = ["January", "February", "March", "April", "May", "June", "July",
+          "August", "September", "October", "November", "December"]
+
+
+def collect_full_dates(soup):
+    return set(FULL_DATE_RE.findall(soup.get_text(" ", strip=True)))
+
+
+def repair_partial_date(text, full_dates):
+    value = clean_text(text)
+    match = PARTIAL_DATE_RE.match(value)
+    if not match:
+        return value
+
+    day, month_name, year = match.groups()
+    if month_name:
+        return value
+
+    months = {m for d, m, y in full_dates if int(d) == int(day) and y == year}
+    if len(months) != 1:
+        return ""
+
+    month = int(months.pop())
+    return f"{int(day):02d}-{month:02d}-{year}"
+
+
+def extract_case_details_positional(soup):
+    table = soup.find("table", class_="case_details_table")
+    if not table:
+        return {}
+
+    slots = ["Filing", "Registration"]
+    details = {}
+
+    for index, row in enumerate(table.find_all("tr")):
+        cols = [clean_text(c.get_text(" ", strip=True)) for c in row.find_all("td")]
+        values = [c for c in cols if c]
+        if not values:
+            continue
+
+        if index < len(slots) and len(values) >= 1:
+            details[f"{slots[index]} Number"] = values[0]
+            if len(values) >= 2:
+                details[f"{slots[index]} Date"] = values[1]
+        elif "-" in values[0] and len(values[0]) >= 15:
+            details["CNR Number"] = values[0]
+
+    return details
+
+
+DISPOSAL_MARKERS = (
+    "disposed", "dismissed", "allowed", "withdrawn", "abated", "rejected",
+    "compromise", "contested", "uncontested", "decided", "settled", "quashed",
+)
+
+
+def looks_like_disposal(text):
+    lowered = text.lower()
+    return any(marker in lowered for marker in DISPOSAL_MARKERS)
+
+
+def extract_case_status_positional(soup, full_dates):
+    table = soup.find("table", class_="table_r")
+    if not table:
+        return {}
+
+    status = {}
+    slots = []
+
+    for row in table.find_all("tr"):
+        cols = row.find_all("td")
+        if len(cols) < 2:
+            continue
+
+        label = clean_text(cols[0].get_text(" ", strip=True)).replace(":", "")
+        value = clean_text(cols[1].get_text(" ", strip=True))
+
+        if label:
+            if value:
+                status[label] = value
+        else:
+            slots.append(value)
+
+    def slot(index):
+        return slots[index] if index < len(slots) else ""
+
+    first_hearing = repair_partial_date(slot(0), full_dates)
+    second_date = repair_partial_date(slot(1), full_dates)
+    stage_or_disposal = slot(2)
+
+    if first_hearing:
+        status.setdefault("First Hearing Date", first_hearing)
+
+    if stage_or_disposal and looks_like_disposal(stage_or_disposal):
+        if second_date:
+            status.setdefault("Decision Date", second_date)
+        status.setdefault("Nature of Disposal", stage_or_disposal)
+        status.setdefault("Case Status", "Disposed")
+    else:
+        if second_date:
+            status.setdefault("Next Date", second_date)
+        if stage_or_disposal:
+            status.setdefault("Stage of Case", stage_or_disposal)
+
+    return status
+
+
 def extract_high_court_case_history(soup):
     history = []
     for table in soup.find_all("table", {"class": "history_table"}):
         headers = [th.get_text(strip=True) for th in table.find_all("th")]
+        rows_all = table.find_all("tr")
 
-        if "Cause List Type" in headers and "Purpose of hearing" in headers:
-            rows = table.find_all("tr")[1:]
+        five_col = any(len(r.find_all("td")) >= 5 for r in rows_all[1:])
+
+        if "Cause List Type" in headers or five_col:
+            rows = rows_all[1:]
             for row in rows:
                 cols = row.find_all("td")
                 if len(cols) >= 5:
@@ -290,6 +402,12 @@ def parse_case_history(html, payload, second_payload,session):
         "Next Hearing Date",
         "Tentative Date"
     ])
+
+    full_dates = collect_full_dates(soup)
+    if not case_details:
+        case_details = extract_case_details_positional(soup)
+    if not case_status:
+        case_status = extract_case_status_positional(soup, full_dates)
 
     petitioner_and_advocate = extract_party_details(
         soup, "Petitioner_Advocate_table")
@@ -631,9 +749,12 @@ def fetch_submit_hc_info(case_data: CaseRequestBulkIngest):
             f"reg_no={result.get('RegistrationNumber')!r}"
         )
 
-        # A page with no history AND no registration number means HC services
-        # blocked/failed the request — don't return an empty shell as success.
-        if not result.get("case_history") and not result.get("RegistrationNumber"):
+        if not any((
+            result.get("case_history"),
+            result.get("RegistrationNumber"),
+            result.get("FilingNumber"),
+            result.get("orders"),
+        )):
             return JSONResponse(
                 content={"error": "HC services returned a page with no case data"},
                 status_code=502
