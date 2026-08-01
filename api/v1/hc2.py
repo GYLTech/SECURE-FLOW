@@ -434,9 +434,6 @@ def parse_case_history(html, payload, second_payload,session):
         "RegistrationNumber": case_details.get("Registration Number", ""),
         "CNRNumber": second_payload.get("cino"),
         "FirstHearingDate": status_value(case_status, "First Hearing Date"),
-        # Disposed HC pages have no "Stage of Case" row and no history table —
-        # disposal lives in "Case Status" / "Decision Date", so map those too
-        # or disposed cases look active-with-no-history forever.
         "CaseStatus": status_value(case_status, "Stage of Case", "Case Status"),
         "DecisionDate": status_value(case_status, "Decision Date"),
         "NatureofDisposal": status_value(case_status, "Nature of Disposal"),

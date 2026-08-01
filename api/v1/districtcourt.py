@@ -17,7 +17,12 @@ from core.s3_client import s3_client
 from core.lambda_client import lambda_client
 from helpers.solve_captcha import solve_captcha
 from helpers.requests import safe_get
-from helpers.orders import order_pdf_s3_key, stable_order_doc_id
+from helpers.orders import (
+    cached_case_needs_orders,
+    order_pdf_s3_key,
+    orders_stamp,
+    stable_order_doc_id,
+)
 from helpers.ecourts_session import (
     BASE_URL,
     EcourtsBlockedError,
@@ -445,6 +450,64 @@ def extract_acts_and_sections(
     return acts_and_sections
 
 
+def order_pdf_headers(session):
+    """Gate headers minus the AJAX-only bits - this GET is a document fetch."""
+    headers = dict(ecourts_gate_headers(session))
+    headers.pop("X-Requested-With", None)
+    headers["Accept"] = "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8"
+    headers["Referer"] = BASE_URL + "?p=home/viewHistory"
+    return headers
+
+
+def download_order_pdf(session, pdf_url):
+    """Fetch the temporary PDF URL and return its bytes, or None.
+
+    The old code streamed `response.raw` straight into S3, which skips content
+    decoding and never checks that what came back is a PDF at all - an HTML
+    "Invalid Request" page would land in the bucket as application/pdf.
+    """
+    try:
+        response = session.get(
+            pdf_url,
+            headers=order_pdf_headers(session),
+            timeout=(30, 180),
+        )
+    except Exception as exc:
+        print(f"[dc/orders] PDF fetch failed for {pdf_url}: {exc}")
+        return None
+
+    if response.status_code != 200:
+        print(f"[dc/orders] PDF {pdf_url} returned HTTP {response.status_code}")
+        return None
+
+    body = response.content
+    start = body.find(b"%PDF", 0, 1024)
+    if start < 0:
+        print(
+            f"[dc/orders] {pdf_url} did not return a PDF "
+            f"({len(body)} bytes, starts {body[:40]!r})"
+        )
+        return None
+
+    return body[start:]
+
+
+def order_section_type(table):
+    """Which order table this is, from the heading eCourts prints above it.
+
+    Interim orders and the final judgement land in separate tables that are
+    otherwise identical, so the heading is the only thing telling them apart.
+    """
+    heading = table.find_previous(["h2", "h3", "h4"])
+    text = heading.get_text(" ", strip=True).lower() if heading else ""
+
+    if "final" in text or "judgement" in text or "judgment" in text:
+        return "final"
+    if "interim" in text:
+        return "interim"
+    return "order"
+
+
 def fetch_and_store_orders(
     soup,
     session,
@@ -460,15 +523,27 @@ def fetch_and_store_orders(
     orders_prefix = build_case_base_path(metadata) + "orders/"
     orders = []
     seen_doc_ids = set()
-    order_table = soup.find("table", {"class": table_class})
 
-    if not order_table:
+    # eCourts splits orders across two tables - "Interim Orders" and "Final
+    # Orders / Judgements". Reading only the first silently drops every final
+    # judgement, which is usually the order that actually matters.
+    order_tables = soup.find_all("table", {"class": table_class})
+
+    if not order_tables:
+        print(f"[dc/orders] no '{table_class}' table in markup, 0 orders")
         return orders
 
-    rows = order_table.find_all("tr")[1:]
+    rows = [
+        (order_section_type(table), row)
+        for table in order_tables
+        for row in table.find_all("tr")
+    ]
     remember_app_token(session, case_details.get("app_token", ""))
 
-    for row in rows:
+    for order_type, row in rows:
+        if row.find("th"):
+            continue
+
         cols = row.find_all("td")
         if len(cols) < 3:
             continue
@@ -476,27 +551,39 @@ def fetch_and_store_orders(
         order_number = cols[0].text.strip()
         order_date = cols[1].text.strip()
 
-        order_link = cols[2].find("a")
-        if not order_link:
+        anchor = next(
+            (a for a in row.find_all("a")
+             if "displayPdf" in a.get("onclick", "")),
+            None,
+        )
+
+        # A data row either links its PDF or carries a real date. A header row
+        # rendered with <td> instead of <th> has neither.
+        if not anchor and not re.search(r"\d", order_date):
             continue
 
-        inner_a_tag = None
-        for a in order_link.find_all("a"):
-            onclick = a.get("onclick", "")
-            if "displayPdf" in onclick:
-                inner_a_tag = a
-                break
+        def keep(link, status, order_type=order_type):
+            orders.append({
+                "order_number": order_number,
+                "order_date": order_date,
+                "order_link": link,
+                "order_status": status,
+                "order_type": order_type,
+            })
 
-        order_link = inner_a_tag or order_link
+        if not anchor:
+            keep(None, "not_uploaded")
+            continue
 
-        onclick_attr = order_link.get("onclick", "")
-        match = re.search(r"displayPdf\((.*?)\)", onclick_attr)
+        match = re.search(r"displayPdf\((.*?)\)", anchor.get("onclick", ""))
 
         if not match:
+            keep(None, "not_uploaded")
             continue
 
         values = [v.strip().strip("'") for v in match.group(1).split(",")]
         if len(values) < 4:
+            keep(None, "unavailable")
             continue
 
         doc_id = stable_order_doc_id(values[3])
@@ -514,48 +601,61 @@ def fetch_and_store_orders(
             "app_token": getattr(session, "_app_token", "")
         }
 
-        order_response = safe_post(session, pdf_endpoint, order_payload)
+        try:
+            order_response = safe_post(session, pdf_endpoint, order_payload)
+        except Exception as exc:
+            print(f"[dc/orders] display_pdf request failed for {values[3]}: {exc}")
+            keep(None, "unavailable")
+            continue
 
         try:
-            response_json = order_response.json()
-            pdf_path = response_json.get("order", "").replace("\\", "")
+            pdf_path = order_response.json().get("order", "").replace("\\", "")
         except Exception:
+            print(
+                f"[dc/orders] display_pdf non-JSON for {values[3]}: "
+                f"HTTP {order_response.status_code} "
+                f"{order_response.text[:160]!r}"
+            )
+            keep(None, "unavailable")
             continue
 
         if not pdf_path:
+            keep(None, "not_uploaded")
             continue
 
         final_pdf_url = f"{pdf_base_url}{pdf_path}"
         s3_key = order_pdf_s3_key(orders_prefix, order_date, values[3])
+        s3_url = f"https://{bucket_name}.s3.{region_name}.amazonaws.com/{s3_key}"
 
         try:
-            s3_client.head_object(Bucket=bucket_name, Key=s3_key)
-            s3_url = f"https://{bucket_name}.s3.{region_name}.amazonaws.com/{s3_key}"
-        except s3_client.exceptions.ClientError as e:
-            if e.response["Error"]["Code"] == "404":
-                pdf_response = session.get(final_pdf_url, stream=True)
-                if pdf_response.status_code == 200:
-                    s3_client.upload_fileobj(
-                        pdf_response.raw,
-                        bucket_name,
-                        s3_key,
-                        ExtraArgs={
-                            "ContentType": "application/pdf",
-                            "ContentDisposition": "inline"
-                        }
-                    )
-                    s3_url = f"https://{bucket_name}.s3.{region_name}.amazonaws.com/{s3_key}"
-                else:
-                    s3_url = None
-            else:
-                s3_url = None
+            try:
+                s3_client.head_object(Bucket=bucket_name, Key=s3_key)
+            except s3_client.exceptions.ClientError as e:
+                if e.response["Error"]["Code"] != "404":
+                    raise
+                body = download_order_pdf(session, final_pdf_url)
+                if body is None:
+                    keep(None, "unavailable")
+                    continue
+                s3_client.put_object(
+                    Bucket=bucket_name,
+                    Key=s3_key,
+                    Body=body,
+                    ContentType="application/pdf",
+                    ContentDisposition="inline",
+                )
+                print(f"[dc/orders] stored {s3_key} ({len(body)} bytes)")
+        except Exception as exc:
+            print(f"[dc/orders] S3 store failed for {s3_key}: {exc}")
+            keep(None, "unavailable")
+            continue
 
-        orders.append({
-            "order_number": order_number,
-            "order_date": order_date,
-            "order_link": s3_url
-        })
+        keep(s3_url, "available")
 
+    print(
+        f"[dc/orders] rows={len(rows)} kept={len(orders)} "
+        f"withLink={sum(1 for o in orders if o['order_link'])}"
+    )
     return orders
 
 
@@ -574,7 +674,11 @@ def fetch_submit_info(case_data: CaseRequest):
     }
     existing_case = collection.find_one(ac_query)
 
-    if existing_case and case_data.refresh == 0:
+    if (
+        existing_case
+        and case_data.refresh == 0
+        and not cached_case_needs_orders(existing_case)
+    ):
         existing_case["_id"] = str(existing_case["_id"])
         return JSONResponse(content=jsonable_encoder(existing_case))
 
@@ -700,7 +804,7 @@ def fetch_submit_info(case_data: CaseRequest):
 
 
                     final_response = {**case_info, **case_fir_details, **case_details, **case_status, **case_petitioner,
-                                      **case_respondent, **acts_and_sections, **case_history, **case_transfer,"s3_prefix" : case_json_s3_path, "orders": orders}
+                                      **case_respondent, **acts_and_sections, **case_history, **case_transfer,"s3_prefix" : case_json_s3_path, "orders": orders, "orders_synced_at": orders_stamp()}
 
                     
                     final_response["_id"] = save_case(final_response, existing_case_id)
@@ -885,6 +989,46 @@ def fetch_submit_info(case_data: CaseRequestBulk):
         release_ecourts_session(session, discard)
 
 CNR_HISTORY_URL = BASE_URL + "?p=cnr_status/viewCNRHistory/"
+HISTORY_URL = BASE_URL + "?p=home/viewHistory"
+
+
+def fetch_history_by_search(session, case_info):
+    """Pull case history through the search route.
+
+    Only this route renders the `displayPdf(...)` order anchors that carry the
+    filename token. The CNR route below returns the same case with the order
+    cells stripped of their links - just the text and an empty <span> where the
+    anchor would be - so orders scraped from it can never be downloaded. Try
+    this first and keep the CNR route as the fallback.
+    """
+    payload = {
+        "court_code": str(case_info.get("court_code") or ""),
+        "state_code": str(case_info.get("state_code") or ""),
+        "dist_code": str(case_info.get("dist_code") or ""),
+        "court_complex_code": str(case_info.get("court_complex_code") or ""),
+        "case_no": str(case_info.get("case_no") or ""),
+        "cino": str(case_info.get("cino") or ""),
+        "rgyear": str(case_info.get("rgyear") or ""),
+        "search_flag": "CScaseNumber",
+        "search_by": "CScaseNumber",
+        "ajax_req": "true",
+        "app_token": getattr(session, "_app_token", ""),
+    }
+
+    if case_info.get("est_code") is not None:
+        payload["est_code"] = str(case_info["est_code"])
+
+    response = safe_post(session, HISTORY_URL, payload)
+
+    if response.status_code != 200:
+        return "", f"viewHistory returned HTTP {response.status_code}"
+
+    try:
+        body = response.json()
+    except Exception:
+        return "", "viewHistory returned a non-JSON response"
+
+    return body.get("data_list") or "", str(body.get("errormsg", "") or "")
 
 
 def fetch_history_by_cnr(session, cino):
@@ -935,7 +1079,11 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
 
         existing_case = collection.find_one(ac_query)
 
-        if existing_case and single_case.refresh == 0:
+        if (
+            existing_case
+            and single_case.refresh == 0
+            and not cached_case_needs_orders(existing_case)
+        ):
             existing_case["_id"] = str(existing_case["_id"])
             return JSONResponse(content=jsonable_encoder(existing_case))
 
@@ -955,10 +1103,19 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
 
         get_app_token(session)
 
-        data_list, errormsg = fetch_history_by_cnr(session, case_info["cino"])
+        # Search route first - it is the only one whose markup carries the
+        # order tokens. Fall back to the CNR route when the PHP session has no
+        # search state, accepting that those orders arrive without links.
+        data_list, errormsg = fetch_history_by_search(session, case_info)
+        source = "viewHistory"
+
+        if not data_list.strip():
+            data_list, errormsg = fetch_history_by_cnr(session, case_info["cino"])
+            source = "viewCNRHistory"
 
         print(
-            f"[dc/bulk_i] cino={single_case.cino} html_len={len(data_list)} "
+            f"[dc/bulk_i] cino={single_case.cino} source={source} "
+            f"html_len={len(data_list)} order_tokens={data_list.count('displayPdf')} "
             f"errormsg={errormsg[:150]!r}"
         )
 
@@ -1016,7 +1173,8 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
         final_response = {
             **metadata,
             "s3_prefix": case_json_s3_path,
-            "orders": orders
+            "orders": orders,
+            "orders_synced_at": orders_stamp()
         }
     
 

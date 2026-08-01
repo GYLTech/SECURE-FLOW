@@ -1,6 +1,38 @@
 import hashlib
+import os
 import re
+import time
 from urllib.parse import parse_qs, urlparse
+
+ORDERS_RECHECK_SECONDS = int(os.getenv("ORDERS_RECHECK_SECONDS", str(24 * 3600)))
+
+
+def orders_stamp() -> float:
+    return time.time()
+
+
+def cached_case_needs_orders(existing_case) -> bool:
+    """True when a cached case should be re-scraped just for its orders.
+
+    A case stored with an empty order list is ambiguous: the court may have
+    published nothing, or we may have captured it before order extraction
+    worked. Serving that cache forever means the order can never appear, so an
+    empty list is re-checked - but only once per ORDERS_RECHECK_SECONDS, so a
+    genuinely order-less case is not re-scraped on every import.
+    """
+    if not existing_case:
+        return False
+    if existing_case.get("orders"):
+        return False
+
+    checked_at = existing_case.get("orders_synced_at")
+    if not checked_at:
+        return True
+
+    try:
+        return (time.time() - float(checked_at)) > ORDERS_RECHECK_SECONDS
+    except (TypeError, ValueError):
+        return True
 
 
 def stable_order_doc_id(source_ref: str) -> str:

@@ -130,16 +130,30 @@ def _candidate_headers(value, alias):
 
 
 def _probe(session, headers, app_token):
+    # Always probe with the session's live token: a previous probe in this same
+    # discovery loop will have rotated it.
+    token = getattr(session, "_app_token", "") or app_token
+
     try:
         response = session.post(
             PROBE_URL,
-            data={"state_code": "1", "ajax_req": "true", "app_token": app_token},
+            data={"state_code": "1", "ajax_req": "true", "app_token": token},
             headers=headers,
             timeout=(10, 60),
         )
     except Exception as exc:
         print(f"[gate] probe error: {exc}")
         return False
+
+    # eCourts rotates app_token on every response, this probe included. Dropping
+    # the rotation leaves the caller posting a token the server has retired,
+    # which comes back as "Invalid Request" on the very next call.
+    try:
+        rotated = response.json().get("app_token")
+        if rotated:
+            session._app_token = rotated
+    except Exception:
+        pass
 
     if looks_blocked(response):
         raise EcourtsBlockedError(
