@@ -24,7 +24,7 @@ GATE_TTL_SECONDS = int(os.getenv("ECOURTS_GATE_TTL", "600"))
 MAX_DISCOVERY_FETCHES = int(os.getenv("ECOURTS_GATE_MAX_FETCHES", "12"))
 
 BREAKER_THRESHOLD = int(os.getenv("ECOURTS_BREAKER_THRESHOLD", "5"))
-BREAKER_COOLDOWN_SECONDS = int(os.getenv("ECOURTS_BREAKER_COOLDOWN", "900"))
+BREAKER_COOLDOWN_SECONDS = int(os.getenv("ECOURTS_BREAKER_COOLDOWN", "60"))
 
 
 class EcourtsGateError(Exception):
@@ -130,8 +130,6 @@ def _candidate_headers(value, alias):
 
 
 def _probe(session, headers, app_token):
-    # Always probe with the session's live token: a previous probe in this same
-    # discovery loop will have rotated it.
     token = getattr(session, "_app_token", "") or app_token
 
     try:
