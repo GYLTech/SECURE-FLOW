@@ -44,6 +44,9 @@ REGION_NAME = os.getenv("REGION_NAME")
 
 app = APIRouter()
 MAX_RETRIES = 5
+# the solver misreads a share of the arithmetic captchas, so allow a few extra
+# reads that never reach the site
+MAX_CAPTCHA_READS = 12
 FORM_CACHE_TTL = 6 * 60 * 60
 NONCE_FAILURE = "Nonce Verification Failed"
 
@@ -94,6 +97,8 @@ def extract_case_data(html_content: str, case_status: str):
 
     for row in rows:
         diary_no = row.get("data-diary-no")
+        if not diary_no:
+            continue
         diary_year = row.get("data-diary-year")
 
         petitioner = row.select_one("td.petitioners")
@@ -110,30 +115,33 @@ def extract_case_data(html_content: str, case_status: str):
     return results
 
 
-def extract_party_name_data(html_content):
+def cell_text(cells, index):
+    return clean_text(cells[index].get_text(" ")) if len(cells) > index else None
+
+
+def extract_party_name_data(html_content, party_status):
     soup = BeautifulSoup(html_content or "", "html.parser")
     results = []
 
     for row in soup.select("table tbody tr"):
-        cells = row.select("td")
-        if len(cells) < 6:
+        diary_no = row.get("data-diary-no")
+        if not diary_no:
             continue
 
+        cells = row.select("td")
         petitioner = row.select_one("td.petitioners")
         respondent = row.select_one("td.respondents")
         link = row.select_one("a[href]")
 
         results.append({
-            "diary_number": row.get("data-diary-no"),
+            "diary_number": diary_no,
             "year": row.get("data-diary-year"),
-            "case_number": clean_text(cells[2].get_text(" ")),
-            "petitioner_name": clean_text(
-                (petitioner or cells[3]).get_text(" ")
-            ),
-            "respondent_name": clean_text(
-                (respondent or cells[4]).get_text(" ")
-            ),
-            "status": clean_text(cells[5].get_text(" ")),
+            "case_number": cell_text(cells, 2),
+            # the import pipeline reads case_status, the table shows status
+            "case_status": party_status,
+            "petitioner_name": clean_text(petitioner.get_text(" ")) if petitioner else cell_text(cells, 3),
+            "respondent_name": clean_text(respondent.get_text(" ")) if respondent else cell_text(cells, 4),
+            "status": cell_text(cells, 5),
             "details_link": (
                 "https://www.sci.gov.in/" + link["href"] if link else None
             ),
@@ -145,7 +153,7 @@ def extract_party_name_data(html_content):
 _form_cache = {}
 _form_lock = threading.Lock()
 
-CAPTCHA_EXPRESSION = re.compile(r"^(\d{1,3})\s*([+\-x*])\s*(\d{1,3})$")
+CAPTCHA_EXPRESSION = re.compile(r"^(\d+)([+\-x*])(\d+)$")
 
 
 def generate_scid():
@@ -155,23 +163,32 @@ def generate_scid():
 
 
 def evaluate_captcha(expression):
+    """SCI captchas are single digit arithmetic ("8 + 5"), so the OCR text must
+    carry an operator. A bare number means the operator was lost and the read is
+    unusable - answering with it is always wrong, so ask for a fresh captcha
+    instead. The OCR also likes to duplicate a digit ("44-1" for "4 - 1"), hence
+    reading the operand nearest the operator."""
     if not expression:
         return None
 
     text = str(expression).strip().replace(" ", "")
-    if text.isdigit():
-        return int(text)
-
     match = CAPTCHA_EXPRESSION.match(text)
     if not match:
         return None
 
-    left, operator, right = int(match.group(1)), match.group(2), int(match.group(3))
+    left, operator, right = int(match.group(1)[-1]), match.group(2), int(match.group(3)[0])
     if operator == "+":
         return left + right
     if operator == "-":
         return left - right
     return left * right
+
+
+def results_html(data_value):
+    """SCI returns either {"resultsHtml": ...} or the markup directly."""
+    if isinstance(data_value, dict):
+        return data_value.get("resultsHtml") or ""
+    return data_value if isinstance(data_value, str) else ""
 
 
 def scrape_form_fields(session, form_url, form_id):
@@ -201,8 +218,12 @@ def get_form_fields(session, form_url, form_id, force_refresh=False):
 
 def submit_sci_form(session, form_url, form_id, action, fields):
     force_refresh = False
+    submissions = 0
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    for _ in range(MAX_CAPTCHA_READS):
+        if submissions >= MAX_RETRIES:
+            break
+
         payload = get_form_fields(session, form_url, form_id, force_refresh=force_refresh)
         force_refresh = False
         payload["scid"] = generate_scid()
@@ -218,8 +239,10 @@ def submit_sci_form(session, form_url, form_id, action, fields):
 
         result_captcha = evaluate_captcha(expression)
         if result_captcha is None:
+            # unreadable captcha - pull a fresh one without spending a submission
             continue
 
+        submissions += 1
         payload.update(fields)
         payload.update({
             "siwp_captcha_value": str(result_captcha),
@@ -275,16 +298,18 @@ class CaseRequestPartyName(BaseModel):
     @field_validator("party_name")
     @classmethod
     def validate_party_name(cls, value):
-        cleaned = value.strip()
-        if not re.fullmatch(r"[A-Za-z][A-Za-z .'-]*", cleaned):
-            raise ValueError("party_name must contain letters only")
+        cleaned = clean_text(value or "")
+        if len(cleaned) < 2 or not re.search(r"[A-Za-z]", cleaned):
+            raise ValueError("party_name must be at least 2 characters and contain a letter")
+        if not re.fullmatch(r"[A-Za-z0-9 .,'&/()\-]+", cleaned):
+            raise ValueError("party_name contains unsupported characters")
         return cleaned
 
     @field_validator("party_status")
     @classmethod
     def validate_party_status(cls, value):
         if value not in ("P", "D"):
-            raise ValueError("party_status must be 'P' or 'D'")
+            raise ValueError("party_status must be 'P' (pending) or 'D' (disposed)")
         return value
 
     @field_validator("party_type")
@@ -543,7 +568,7 @@ def fetch_submit_info(case_data: CaseRequest):
 
 
 @app.post("/sci/bulk_q/aor")
-def fetch_submit_info(case_data: CaseRequestAOR):
+def fetch_aor_info(case_data: CaseRequestAOR):
     session = requests.Session()
 
     try:
@@ -569,13 +594,20 @@ def fetch_submit_info(case_data: CaseRequestAOR):
         data_value = response_json.get("data")
         if not data_value or "No records found" in str(data_value):
             return JSONResponse(
-                content={"error": "Invalid Case Details"},
+                content={"error": "No cases found for this AOR code"},
                 status_code=404
             )
 
-        cases = extract_case_data(data_value.get("resultsHtml"), case_data.case_status)
+        cases = extract_case_data(results_html(data_value), case_data.case_status)
+        if not cases:
+            return JSONResponse(
+                content={"error": "No cases found for this AOR code"},
+                status_code=404
+            )
+
         return JSONResponse(content={
             "success": True,
+            "count": len(cases),
             "data": cases
         }, status_code=200)
 
@@ -613,11 +645,17 @@ def fetch_party_name_info(case_data: CaseRequestPartyName):
         data_value = response_json.get("data")
         if not data_value or "No records found" in str(data_value):
             return JSONResponse(
-                content={"error": "Invalid Case Details"},
+                content={"error": "No cases found for this party name"},
                 status_code=404
             )
 
-        cases = extract_party_name_data(data_value.get("resultsHtml"))
+        cases = extract_party_name_data(results_html(data_value), case_data.party_status)
+        if not cases:
+            return JSONResponse(
+                content={"error": "No cases found for this party name"},
+                status_code=404
+            )
+
         return JSONResponse(content={
             "success": True,
             "count": len(cases),
