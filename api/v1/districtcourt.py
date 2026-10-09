@@ -1,3 +1,4 @@
+import traceback
 import base64
 import json
 import random
@@ -16,7 +17,7 @@ from core.database import collection, save_case
 from core.s3_client import s3_client
 from core.lambda_client import lambda_client
 from helpers.solve_captcha import solve_captcha
-from helpers.requests import safe_get
+from helpers.requests import safe_get, polite_pause, TIMEOUT
 from helpers.orders import (
     cached_case_needs_orders,
     order_pdf_s3_key,
@@ -51,6 +52,9 @@ APP_TOKEN_RE = re.compile(r'name="app_token"[^>]*value="([^"]+)"')
 ECOURTS_PROXY = os.getenv("ECOURTS_PROXY")
 POOL_SIZE = int(os.getenv("ECOURTS_POOL_SIZE", "4"))
 BLOCK_RETRIES = 4
+# How long a request may wait for one of the POOL_SIZE eCourts slots before
+# giving up with "busy" instead of hanging until the caller times out
+SLOT_WAIT_SECONDS = float(os.getenv("ECOURTS_SLOT_WAIT", "60"))
 
 SESSION_MAX_AGE_SECONDS = int(os.getenv("ECOURTS_SESSION_MAX_AGE", "600"))
 SESSION_MAX_USES = int(os.getenv("ECOURTS_SESSION_MAX_USES", "25"))
@@ -94,18 +98,21 @@ def new_ecourts_session():
     session._gate_ready = False
     session._search_validated = False
 
-    response = safe_get(session, BASE_URL + "?p=casestatus/index")
-    if looks_blocked(response):
-        session.close()
-        breaker.record_block()
-        raise EcourtsBlockedError(
-            "eCourts is refusing requests from this IP (HTTP 405 throttle "
-            "stub). Retry later, or route through another IP via ECOURTS_PROXY."
-        )
+    try:
+        response = safe_get(session, BASE_URL + "?p=casestatus/index")
+        if looks_blocked(response):
+            breaker.record_block()
+            raise EcourtsBlockedError(
+                "eCourts is refusing requests from this IP (HTTP 405 throttle "
+                "stub). Retry later, or route through another IP via ECOURTS_PROXY."
+            )
 
-    match = APP_TOKEN_RE.search(response.text)
-    remember_app_token(session, match.group(1) if match else "")
-    ecourts_gate_headers(session)
+        match = APP_TOKEN_RE.search(response.text)
+        remember_app_token(session, match.group(1) if match else "")
+        ecourts_gate_headers(session)
+    except BaseException:
+        session.close()
+        raise
     session._gate_ready = True
     breaker.record_success()
     return session
@@ -147,6 +154,16 @@ def _acquire_session():
             breaker.check()
             print(f"[warn] eCourts throttling this IP (attempt {attempt})")
             time.sleep(min(2 ** attempt, 20))
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            # eCourts often drops connections mid-handshake (RemoteDisconnected);
+            # these are transient, so retry instead of failing the whole request
+            last_error = EcourtsBlockedError(
+                "eCourts is not responding right now (connection dropped). "
+                "Please try again in a few minutes."
+            )
+            print(f"[warn] eCourts connection dropped while opening session "
+                  f"(attempt {attempt}): {exc!r}")
+            time.sleep(min(2 ** attempt, 20))
     raise last_error
 
 
@@ -163,7 +180,10 @@ def _release_session(session, discard=False):
 
 def acquire_ecourts_session():
     breaker.check()
-    _ecourts_gate_slot.acquire()
+    if not _ecourts_gate_slot.acquire(timeout=SLOT_WAIT_SECONDS):
+        raise EcourtsBlockedError(
+            "The case lookup service is busy right now. Please try again in a minute."
+        )
     try:
         return _acquire_session()
     except BaseException:
@@ -246,9 +266,10 @@ def upload_case_json_to_s3(
     return f"s3://{bucket_name}/{key}"
 
 def safe_post(session, url, data, headers=None, max_retries=3):
+    last_error = None
     for attempt in range(max_retries):
         try:
-            time.sleep(random.uniform(1.2, 2.0))
+            polite_pause(attempt)
 
             merged_headers = {"Connection": "close"}
             merged_headers.update(ecourts_gate_headers(session))
@@ -261,7 +282,7 @@ def safe_post(session, url, data, headers=None, max_retries=3):
             response = session.post(
                 url,
                 data=data,
-                timeout=(10, 120),
+                timeout=TIMEOUT,
                 headers=merged_headers
             )
 
@@ -288,14 +309,15 @@ def safe_post(session, url, data, headers=None, max_retries=3):
             breaker.record_success()
             return response
 
-        except (requests.exceptions.ConnectionError, RemoteDisconnected) as e:
-            print(f"[warn] Server disconnected (attempt {attempt+1})")
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, RemoteDisconnected) as e:
+            last_error = e
+            print(f"[warn] eCourts POST failed (attempt {attempt+1}/{max_retries}): {type(e).__name__}")
             session.close()
 
-        except requests.exceptions.Timeout:
-            print(f"[warn] Timeout (attempt {attempt+1})")
-
-    raise Exception("[error] eCourts request failed after retries")
+    # A requests error so the endpoint answers 503 ("eCourts unreachable"), not 500
+    raise requests.exceptions.ConnectionError(
+        f"eCourts did not respond after {max_retries} attempts: {last_error!r}"
+    )
 
 
 def sanitize_keys(data):
@@ -470,7 +492,7 @@ def download_order_pdf(session, pdf_url):
         response = session.get(
             pdf_url,
             headers=order_pdf_headers(session),
-            timeout=(30, 180),
+            timeout=TIMEOUT,
         )
     except Exception as exc:
         print(f"[dc/orders] PDF fetch failed for {pdf_url}: {exc}")
@@ -686,7 +708,7 @@ def fetch_submit_info(case_data: CaseRequest):
 
     try:
         session = acquire_ecourts_session()
-    except EcourtsBlockedError as exc:
+    except (EcourtsBlockedError, EcourtsGateError) as exc:
         return JSONResponse(content={"error": str(exc)}, status_code=503)
 
     case_info = {}
@@ -819,6 +841,25 @@ def fetch_submit_info(case_data: CaseRequest):
         discard = True
         return JSONResponse(content={"error": str(exc)}, status_code=503)
 
+    except requests.exceptions.RequestException as exc:
+        discard = True
+        print(f"[dc/getcaseInfo] eCourts unreachable for {ac_query}: {exc!r}")
+        return JSONResponse(
+            content={"error": "eCourts is not responding right now. Please try again in a few minutes."},
+            status_code=503,
+        )
+
+    except Exception as exc:
+        # Unexpected parse/S3/DB failure: log the full trace so it can be fixed,
+        # and return a readable error instead of a bare 500
+        discard = True
+        print(f"[dc/getcaseInfo] failed for {ac_query}: {exc!r}")
+        traceback.print_exc()
+        return JSONResponse(
+            content={"error": f"Failed to process case details: {type(exc).__name__}: {exc}"},
+            status_code=502,
+        )
+
     finally:
         release_ecourts_session(session, discard)
 
@@ -904,7 +945,7 @@ def fetch_submit_info(case_data: CaseRequestBulk):
 
     try:
         session = acquire_ecourts_session()
-    except EcourtsBlockedError as exc:
+    except (EcourtsBlockedError, EcourtsGateError) as exc:
         return JSONResponse(content={"error": str(exc)}, status_code=503)
 
     discard = False
@@ -1064,7 +1105,7 @@ def fetch_history_by_cnr(session, cino):
 def fetch_submit_info(single_case: CaseRequestBulkIngest):
     try:
         session = acquire_ecourts_session()
-    except EcourtsBlockedError as exc:
+    except (EcourtsBlockedError, EcourtsGateError) as exc:
         return JSONResponse(content={"error": str(exc)}, status_code=503)
 
     discard = False

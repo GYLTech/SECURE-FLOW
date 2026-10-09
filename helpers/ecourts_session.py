@@ -1,7 +1,10 @@
 import os
+import random
 import re
 import threading
 import time
+
+import requests
 
 BASE_URL = "https://services.ecourts.gov.in/ecourtindia_v6/"
 COMPONENTS_URL = BASE_URL + "js/components.js"
@@ -165,11 +168,25 @@ def _probe(session, headers, app_token):
     return "<option" in response.text or "dist_code" in response.text
 
 
+def _get_components(session, tries=3):
+    # eCourts often drops this request mid-handshake (RemoteDisconnected);
+    # a short retry on the same session almost always gets through
+    for attempt in range(1, tries + 1):
+        try:
+            return session.get(COMPONENTS_URL, timeout=(10, 45))
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            if attempt == tries:
+                raise
+            print(f"[gate] components.js fetch failed (attempt {attempt}): {type(exc).__name__}")
+            session.close()
+            time.sleep(attempt + random.uniform(0, 0.5))
+
+
 def _discover(session, app_token):
     tried = set()
 
     for attempt in range(1, MAX_DISCOVERY_FETCHES + 1):
-        response = session.get(COMPONENTS_URL, timeout=(10, 60))
+        response = _get_components(session)
 
         if looks_blocked(response):
             raise EcourtsBlockedError(
