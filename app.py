@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 import sentry_sdk
-from api.v1 import districtcourt, hc2, hc3, cc, nclt, sci, drt, nclat, ngt, cgat
+from api.v1 import districtcourt, hc2, hc3, cc, nclt, sci, drt, nclat, ngt, cgat, aft
 app = FastAPI(title="Secure Flow By Richstream")
 
 sentry_sdk.init(
@@ -26,6 +26,7 @@ app.include_router(drt.app, prefix="/api/v1", tags=["Drt"])
 app.include_router(nclat.app, prefix="/api/v1", tags=["Nclat"])
 app.include_router(ngt.app, prefix="/api/v1", tags=["Ngt"])
 app.include_router(cgat.app, prefix="/api/v1", tags=["Cgat"])
+app.include_router(aft.app, prefix="/api/v1", tags=["Aft"])
 
 
 if __name__ == "__main__":
