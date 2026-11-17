@@ -3,11 +3,13 @@ import html
 import os
 import random
 import re
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import date, datetime
 from typing import Dict, Literal, Optional
 
+import certifi
 import requests
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
@@ -104,8 +106,20 @@ def request_with_retry(session, url, **kwargs):
     raise AFTError(f"AFT did not respond after {MAX_RETRIES} attempts: {last_error!r}", 503)
 
 
+def build_ca_bundle():
+    intermediate = os.path.join(os.path.dirname(__file__), "..", "..", "core", "certs", "sectigo_dv_r36.pem")
+    bundle = os.path.join(tempfile.gettempdir(), "aft_ca_bundle.pem")
+    with open(certifi.where()) as roots, open(intermediate) as extra, open(bundle, "w") as out:
+        out.write(roots.read() + "\n" + extra.read())
+    return bundle
+
+
+CA_BUNDLE = build_ca_bundle()
+
+
 def open_session():
     session = requests.Session()
+    session.verify = CA_BUNDLE
     session.headers.update({"User-Agent": USER_AGENT})
     return session
 
@@ -385,7 +399,7 @@ def upload_order(link, key):
         if exc.response["Error"]["Code"] not in ("404", "NoSuchKey", "NotFound"):
             return None
     try:
-        response = requests.get(link, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
+        response = requests.get(link, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT, verify=CA_BUNDLE)
     except requests.exceptions.RequestException as exc:
         print(f"[aft] order download failed for {key}: {exc}")
         return None
