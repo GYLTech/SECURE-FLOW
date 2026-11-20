@@ -1229,3 +1229,76 @@ def fetch_submit_info(single_case: CaseRequestBulkIngest):
 
     finally:
         release_ecourts_session(session, discard)
+
+class ComplexListRequest(BaseModel):
+    state_code: str
+    dist_code: str
+
+
+COMPLEX_OPTION_RE = re.compile(r"<option value=['\"]?([^'\" >]+)['\"]?\s*>([^<]*)</option>")
+COMPLEX_CACHE_TTL = int(os.getenv("ECOURTS_COMPLEX_CACHE_TTL", str(24 * 3600)))
+_complex_cache = {}
+_complex_cache_lock = threading.Lock()
+
+
+def parse_complex_options(html):
+    complexes = []
+    for value, name in COMPLEX_OPTION_RE.findall(html or ""):
+        parts = value.split("@")
+        if len(parts) < 2 or not parts[0].isdigit():
+            continue
+        complexes.append({
+            "complex_code": parts[0],
+            "est_codes": [code for code in parts[1].split(",") if code],
+            "has_establishments": len(parts) > 2 and parts[2] == "Y",
+            "name": re.sub(r"\s+", " ", name).strip(),
+        })
+    return complexes
+
+
+@app.post("/dc/complexes")
+def fetch_court_complexes(query: ComplexListRequest):
+    key = (query.state_code, query.dist_code)
+    with _complex_cache_lock:
+        cached = _complex_cache.get(key)
+    if cached and time.monotonic() - cached[0] < COMPLEX_CACHE_TTL:
+        return JSONResponse(content={"data": cached[1]}, status_code=200)
+
+    try:
+        session = acquire_ecourts_session()
+    except (EcourtsBlockedError, EcourtsGateError) as exc:
+        return JSONResponse(content={"error": str(exc)}, status_code=503)
+
+    discard = False
+    try:
+        get_app_token(session)
+        response = safe_post(
+            session,
+            BASE_URL + "?p=casestatus/fillcomplex",
+            {
+                "state_code": query.state_code,
+                "dist_code": query.dist_code,
+                "ajax_req": "true",
+                "app_token": getattr(session, "_app_token", ""),
+            },
+        )
+        try:
+            body = response.json()
+        except Exception:
+            discard = True
+            return JSONResponse(content={"error": "eCourts returned a non-JSON response"}, status_code=502)
+
+        complexes = parse_complex_options(body.get("complex_list", ""))
+        if complexes:
+            with _complex_cache_lock:
+                _complex_cache[key] = (time.monotonic(), complexes)
+        return JSONResponse(content={"data": complexes}, status_code=200)
+
+    except (EcourtsBlockedError, EcourtsGateError) as exc:
+        discard = True
+        return JSONResponse(content={"error": str(exc)}, status_code=503)
+    except requests.exceptions.RequestException as exc:
+        discard = True
+        return JSONResponse(content={"error": str(exc)}, status_code=503)
+    finally:
+        release_ecourts_session(session, discard)

@@ -10,3 +10,4 @@ mangum
 sentry-sdk
 pytz
 gunicorn
+pillow

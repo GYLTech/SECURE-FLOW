@@ -29,7 +29,7 @@ def _item_key(item, key_fields):
     return json.dumps(item, sort_keys=True, default=str)
 
 
-def _merge_append_only(existing_doc, result):
+def _merge_append_only(existing_doc, result, replace_fields=()):
     if not existing_doc:
         return result
 
@@ -41,6 +41,8 @@ def _merge_append_only(existing_doc, result):
                 result[field] = old_items
 
     for field, key_fields in APPEND_ONLY_ARRAYS.items():
+        if field in replace_fields:
+            continue
         new_items = result.get(field)
         if not isinstance(new_items, list):
             continue  # nothing fresh to merge for this field
@@ -57,11 +59,11 @@ def _merge_append_only(existing_doc, result):
     return result
 
 
-def save_case(result, existing_case_id=None):
+def save_case(result, existing_case_id=None, replace_fields=()):
 
     if existing_case_id:
         existing = collection.find_one({"_id": existing_case_id}, _MERGE_PROJECTION)
-        _merge_append_only(existing, result)
+        _merge_append_only(existing, result, replace_fields)
         collection.update_one({"_id": existing_case_id}, {"$set": result})
         return str(existing_case_id)
 
@@ -71,6 +73,6 @@ def save_case(result, existing_case_id=None):
     except DuplicateKeyError:
         cino = result.get("cino")
         existing = collection.find_one({"cino": cino}, _MERGE_PROJECTION)
-        _merge_append_only(existing, result)
+        _merge_append_only(existing, result, replace_fields)
         collection.update_one({"cino": cino}, {"$set": result})
         return str(existing["_id"]) if existing else ""

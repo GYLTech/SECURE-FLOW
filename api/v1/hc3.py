@@ -27,12 +27,14 @@ from helpers.orders import (
     orders_stamp,
     stable_order_doc_id,
 )
+from helpers.hc_portals import PortalCaseNotFound, portal_for
 from helpers.requests import safe_get, safe_post
 from helpers.solve_captcha import solve_captcha
 
 load_dotenv()
 BUCKET_NAME = os.getenv("BUCKET_NAME")
 REGION_NAME = os.getenv("REGION_NAME")
+PORTAL_RECHECK_SECONDS = int(os.getenv("HC_PORTAL_RECHECK_SECONDS", str(24 * 3600)))
 
 HC_ORIGIN = "https://hcservices.ecourts.gov.in"
 HC_APP_BASE = f"{HC_ORIGIN}/ecourtindiaHC/"
@@ -823,6 +825,14 @@ def store_orders(orders, session, metadata):
 
     for order in orders:
         href = order.pop("href", "")
+        portal_ref = order.pop("source_ref", "")
+        link_only = order.pop("link_only", False)
+
+        if href and link_only:
+            order["order_link"] = href
+            order["order_status"] = "available"
+            stored.append(order)
+            continue
 
         if not href:
             order["order_link"] = None
@@ -830,7 +840,7 @@ def store_orders(orders, session, metadata):
             stored.append(order)
             continue
 
-        source_ref = hc_source_ref(href)
+        source_ref = portal_ref or hc_source_ref(href)
         doc_id = stable_order_doc_id(source_ref)
         if doc_id in seen_doc_ids:
             continue
@@ -938,14 +948,186 @@ def parse_case_history(page, context, session):
         "objections": extract_objections(soup),
         "document_details": extract_document_details(soup),
         "orders": [],
+        "data_source": "ecourts",
     }
 
-    metadata["orders"] = store_orders(extract_orders(soup), session, metadata)
+    if not metadata["NatureofDisposal"] and "disposed" in metadata["CaseStatus"].lower():
+        metadata["NatureofDisposal"] = "Disposed"
+
+    return finalize_metadata(metadata, extract_orders(soup), session)
+
+
+def finalize_metadata(metadata, orders, session):
+    metadata["orders"] = store_orders(orders, session, metadata)
     metadata["orders_synced_at"] = orders_stamp()
     metadata["s3_prefix"] = upload_case_json_to_s3(
         s3_client, S3_BUCKET, metadata=metadata)
-
     return metadata
+
+
+GAP_FILL_FIELDS = ("FilingNumber", "FilingDate", "case_no", "cino", "case_number")
+
+
+def cache_is_current(existing_case, state_code):
+    portal = portal_for(state_code)
+    if portal is None or existing_case.get("data_source") == portal.NAME:
+        return True
+
+    checked_at = existing_case.get("portal_checked_at")
+    try:
+        return bool(checked_at) and (time.time() - float(checked_at)) < PORTAL_RECHECK_SECONDS
+    except (TypeError, ValueError):
+        return False
+
+
+def load_from_state_portal(context, existing_case=None):
+    portal = portal_for(context.get("state_code"))
+    if portal is None:
+        return None, False
+
+    session = portal.open_session()
+    try:
+        details, orders = portal.fetch_case(
+            session,
+            court_code=context["court_code"],
+            case_type=context["case_type"],
+            case_reg_no=context["case_reg_no"],
+            rgyear=context["rgyear"],
+            cino=context.get("cino") or (existing_case or {}).get("cino") or None,
+        )
+
+        wanted_cino = context.get("cino")
+        if wanted_cino and details.get("cino") and details["cino"] != wanted_cino:
+            print(f"[hc3/{portal.NAME}] CNR mismatch: wanted {wanted_cino}, "
+                  f"portal returned {details['cino']}; falling back to eCourts")
+            return None, True
+
+        metadata = {
+            "courtType": "highcourt",
+            "case_reg_no": context.get("case_reg_no"),
+            "rgyear": context.get("rgyear"),
+            "court_code": context.get("court_code"),
+            "state_code": context.get("state_code"),
+            "dist_code": context.get("dist_code"),
+            "court_complex_code": context.get("court_complex_code"),
+            "est_code": context.get("est_code"),
+            "case_type": context.get("case_type"),
+            **details,
+            "orders": [],
+            "data_source": portal.NAME,
+            "portal_checked_at": time.time(),
+        }
+
+        if context.get("case_no"):
+            metadata["case_no"] = context["case_no"]
+        if not metadata.get("cino"):
+            metadata["cino"] = wanted_cino or ""
+
+        for field in GAP_FILL_FIELDS:
+            if not metadata.get(field) and existing_case and existing_case.get(field):
+                metadata[field] = existing_case[field]
+
+        if not metadata.get("case_history") and existing_case and existing_case.get("case_history"):
+            metadata["case_history"] = existing_case["case_history"]
+
+        for side in ("petitioner", "respondent"):
+            stored = (existing_case or {}).get(f"{side}_details") or []
+            if len(stored) > len(metadata.get(f"{side}_details") or []):
+                metadata[f"{side}_details"] = stored
+                metadata[f"{side}_and_advocate"] = (existing_case.get(f"{side}_and_advocate")
+                                                    or [p.get("name") for p in stored])
+
+        if not metadata.get("cino") or not metadata.get("case_no"):
+            fill_identity_from_ecourts(metadata, context)
+
+        result = finalize_metadata(metadata, orders, session)
+        print(
+            f"[hc3/{portal.NAME}] cino={result.get('cino')} "
+            f"status={result.get('CaseStatus')!r} decided={result.get('DecisionDate')!r} "
+            f"history_rows={len(result.get('case_history') or [])} "
+            f"orders={len(result.get('orders') or [])}"
+        )
+        return result, True
+
+    except PortalCaseNotFound as exc:
+        print(f"[hc3/{portal.NAME}] not on state portal: {exc}")
+        return None, True
+    except Exception as exc:
+        print(f"[hc3/{portal.NAME}] state portal failed ({type(exc).__name__}: {exc}); "
+              f"falling back to eCourts")
+        return None, False
+    finally:
+        session.close()
+
+
+def fill_identity_from_ecourts(metadata, context):
+    session = open_hc_session(context["state_code"], context.get("dist_code") or "1",
+                              context["court_code"])
+    try:
+        records = search_cases(
+            session,
+            state_code=context["state_code"],
+            dist_code=context.get("dist_code") or "1",
+            court_code=context["court_code"],
+            case_type=context["case_type"],
+            case_reg_no=context["case_reg_no"],
+            rgyear=context["rgyear"],
+        )
+        record = pick_record(records, context.get("case_no"), context.get("cino"))
+        if record:
+            metadata["cino"] = metadata.get("cino") or record["cino"]
+            metadata["CNRNumber"] = metadata.get("CNRNumber") or record["cino"]
+            metadata["case_no"] = metadata.get("case_no") or record["case_no"]
+            metadata["case_number"] = metadata.get("case_number") or record["case_number"]
+    except Exception as exc:
+        print(f"[hc3] eCourts identity lookup failed ({type(exc).__name__}: {exc})")
+    finally:
+        session.close()
+
+
+def save_portal_result(result, existing_case_id):
+    portal = portal_for(result.get("state_code"))
+    replaces_history = portal is None or getattr(portal, "PROVIDES_HISTORY", True)
+    return save_case(result, existing_case_id,
+                     replace_fields=("case_history",) if replaces_history else ())
+
+
+ECOURTS_LABEL = "eCourts High Court"
+
+
+def mark_portal_checked(result, state_code, portal_down):
+    if portal_for(state_code) is not None and not portal_down:
+        result["portal_checked_at"] = time.time()
+
+
+def attach_source_warning(result, state_code, portal_down):
+    portal = portal_for(state_code)
+    if portal is not None and portal_down:
+        result["source_warning"] = (
+            f"There is a problem with the {portal.LABEL} website right now, so these "
+            f"details come from {ECOURTS_LABEL} and may be incomplete."
+        )
+
+
+def website_problem_response(state_code, portal_down, ecourts_down):
+    portal = portal_for(state_code)
+    down = []
+    if portal is not None and portal_down:
+        down.append(portal.LABEL)
+    if ecourts_down:
+        down.append(ECOURTS_LABEL)
+    if not down:
+        down.append(ECOURTS_LABEL)
+
+    sites = " and ".join(f"the {name} website" for name in down)
+    return JSONResponse(
+        content={
+            "error": f"There is a problem with {sites} right now. Please try again later.",
+            "error_code": "HC_WEBSITE_DOWN",
+            "down_sources": down,
+        },
+        status_code=502,
+    )
 
 
 def extract_case_data(case_data, raw_text):
@@ -1047,12 +1229,33 @@ def fetch_submit_hc_info(case_data: CaseRequest):
         existing_case
         and case_data.refresh == 0
         and not cached_case_needs_orders(existing_case)
+        and cache_is_current(existing_case, case_data.state_code)
     ):
         existing_case["_id"] = str(existing_case["_id"])
         return JSONResponse(content=jsonable_encoder(existing_case))
 
     existing_case_id = existing_case["_id"] if existing_case else None
     dist_code = case_data.dist_code or "1"
+
+    portal_result, portal_reachable = load_from_state_portal({
+        "case_reg_no": case_data.case_reg_no,
+        "rgyear": case_data.rgyear,
+        "case_type": case_data.case_type,
+        "court_code": case_data.court_complex_code,
+        "state_code": case_data.state_code,
+        "dist_code": dist_code,
+        "court_complex_code": case_data.court_complex_code,
+        "est_code": case_data.est_code,
+    }, existing_case)
+
+    if portal_result:
+        try:
+            portal_result["_id"] = save_portal_result(portal_result, existing_case_id)
+            return JSONResponse(content=jsonable_encoder(portal_result), status_code=200)
+        except Exception as e:
+            return JSONResponse(content={"error": str(e)}, status_code=500)
+
+    portal_down = portal_for(case_data.state_code) is not None and not portal_reachable
     session = open_hc_session(
         case_data.state_code, dist_code, case_data.court_complex_code)
 
@@ -1082,16 +1285,20 @@ def fetch_submit_hc_info(case_data: CaseRequest):
         }
 
         result = parse_case_history(page, context, session=session)
+        mark_portal_checked(result, case_data.state_code, portal_down)
         result["_id"] = save_case(result, existing_case_id)
+        attach_source_warning(result, case_data.state_code, portal_down)
         return JSONResponse(content=result, status_code=200)
 
     except HighCourtCaseNotFound as e:
+        if portal_down:
+            return website_problem_response(case_data.state_code, portal_down, False)
         return JSONResponse(
             content={"data": "Invalid Case Details", "error": str(e)},
             status_code=404
         )
-    except HighCourtScrapeError as e:
-        return JSONResponse(content={"error": str(e)}, status_code=502)
+    except HighCourtScrapeError:
+        return website_problem_response(case_data.state_code, portal_down, True)
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)
     finally:
@@ -1247,6 +1454,7 @@ def fetch_submit_hc_bulk_ingest(case_data: CaseRequestBulkIngest):
         existing_case
         and case_data.refresh == 0
         and not cached_case_needs_orders(existing_case)
+        and cache_is_current(existing_case, case_data.state_code)
     ):
         existing_case["_id"] = str(existing_case["_id"])
         return JSONResponse(content=jsonable_encoder(existing_case))
@@ -1267,6 +1475,28 @@ def fetch_submit_hc_bulk_ingest(case_data: CaseRequestBulkIngest):
 
     court_code = case_data.court_complex_code or case_data.court_code
     dist_code = case_data.dist_code or "1"
+
+    portal_result, portal_reachable = load_from_state_portal({
+        "case_no": case_data.case_no,
+        "cino": case_data.cino,
+        "case_reg_no": case_reg_no,
+        "rgyear": rgyear,
+        "case_type": case_type,
+        "court_code": court_code,
+        "state_code": case_data.state_code,
+        "dist_code": dist_code,
+        "court_complex_code": court_code,
+        "est_code": None,
+    }, existing_case)
+
+    if portal_result:
+        try:
+            portal_result["_id"] = save_portal_result(portal_result, existing_case_id)
+            return JSONResponse(content=jsonable_encoder(portal_result), status_code=200)
+        except Exception as e:
+            return JSONResponse(content={"error": str(e)}, status_code=500)
+
+    portal_down = portal_for(case_data.state_code) is not None and not portal_reachable
     session = open_hc_session(case_data.state_code, dist_code, court_code)
 
     try:
@@ -1312,18 +1542,19 @@ def fetch_submit_hc_bulk_ingest(case_data: CaseRequestBulkIngest):
             result.get("FilingNumber"),
             result.get("orders"),
         )):
-            return JSONResponse(
-                content={"error": "HC services returned a page with no case data"},
-                status_code=502
-            )
+            return website_problem_response(case_data.state_code, portal_down, True)
 
+        mark_portal_checked(result, case_data.state_code, portal_down)
         result["_id"] = save_case(result, existing_case_id)
+        attach_source_warning(result, case_data.state_code, portal_down)
         return JSONResponse(content=result, status_code=200)
 
     except HighCourtCaseNotFound as e:
+        if portal_down:
+            return website_problem_response(case_data.state_code, portal_down, False)
         return JSONResponse(content={"error": str(e)}, status_code=404)
-    except HighCourtScrapeError as e:
-        return JSONResponse(content={"error": str(e)}, status_code=502)
+    except HighCourtScrapeError:
+        return website_problem_response(case_data.state_code, portal_down, True)
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)
     finally:
